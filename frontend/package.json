@@ -1,0 +1,10 @@
+{
+  "name": "stock-daily-review-frontend",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Zero-dependency frontend for the stock review workflow API.",
+  "scripts": {
+    "dev": "python3 -m http.server 5173",
+    "start": "python3 -m http.server 5173"
+  }
+}

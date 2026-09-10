@@ -1,0 +1,131 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="color-scheme" content="dark" />
+    <title>持股复盘控制台</title>
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <div class="app-shell" aria-label="持股复盘控制台">
+      <header class="app-header">
+        <div>
+          <p class="eyebrow">Daily Review Terminal</p>
+          <h1>持股复盘控制台</h1>
+          <p class="subtitle">输入持仓，自动完成截图、AI 复盘、组合摘要与文档输出。</p>
+        </div>
+        <div class="header-status" id="healthStatus" aria-live="polite">
+          <span class="health-dot" id="healthDot"></span>
+          <span id="healthText">检查 API 中</span>
+        </div>
+      </header>
+
+      <main class="app-layout">
+        <section class="panel input-panel" aria-labelledby="formTitle">
+          <div class="panel-header">
+            <div>
+              <p class="panel-kicker">Portfolio</p>
+              <h2 id="formTitle">持仓输入</h2>
+            </div>
+            <label class="date-field">
+              <span>复盘日期</span>
+              <input type="date" id="reviewDate" aria-label="复盘日期" />
+            </label>
+          </div>
+
+          <form id="reviewForm" novalidate>
+            <div class="holding-grid holding-head" aria-hidden="true">
+              <span>股票名称 / 代码</span>
+              <span>成本价</span>
+              <span>持股数</span>
+              <span>计划周期</span>
+              <span></span>
+            </div>
+            <div id="holdingRows"></div>
+
+            <div class="row-actions">
+              <button type="button" class="ghost-button" id="addHolding">+ 增加持仓</button>
+              <label class="check-field">
+                <input type="checkbox" id="forceRun" />
+                <span>覆盖同日已有任务</span>
+              </label>
+            </div>
+
+            <div class="api-field">
+              <label for="apiBase">后端 API 地址</label>
+              <input id="apiBase" type="url" spellcheck="false" autocomplete="url" />
+            </div>
+
+            <div class="action-stack">
+              <button type="submit" class="primary-button" id="startRun">一键自动复盘</button>
+              <div class="secondary-actions">
+                <button type="button" class="ghost-button" id="resumeRun">重试失败项</button>
+                <button type="button" class="ghost-button" id="renderDocument">重新渲染文档</button>
+              </div>
+            </div>
+          </form>
+        </section>
+
+        <section class="panel monitor-panel" aria-labelledby="monitorTitle">
+          <div class="panel-header">
+            <div>
+              <p class="panel-kicker">Workflow</p>
+              <h2 id="monitorTitle">执行监控</h2>
+            </div>
+            <div class="state-pills">
+              <span class="pill" id="statusPill">未开始</span>
+              <span class="pill muted" id="stagePill">阶段：—</span>
+            </div>
+          </div>
+
+          <div class="progress-wrap">
+            <div class="progress-meta">
+              <span id="progressText">等待任务创建</span>
+              <span id="progressCount">0 / 0</span>
+            </div>
+            <div class="progress-track"><div class="progress-bar" id="progressBar"></div></div>
+          </div>
+
+          <div class="task-list" id="taskList">
+            <div class="empty-state">创建任务后，这里将显示每只股票的截图与 AI 状态。</div>
+          </div>
+
+          <div class="event-log">
+            <div class="event-head">
+              <span>事件流</span>
+              <button type="button" class="text-button" id="refreshStatus">刷新状态</button>
+            </div>
+            <ul id="eventList" aria-live="polite"></ul>
+          </div>
+        </section>
+      </main>
+
+      <section class="panel document-panel" aria-labelledby="documentTitle">
+        <div class="panel-header">
+          <div>
+            <p class="panel-kicker">Output</p>
+            <h2 id="documentTitle">最终复盘文档</h2>
+          </div>
+          <div class="document-actions">
+            <button type="button" class="ghost-button" id="showRendered">阅读视图</button>
+            <button type="button" class="ghost-button" id="showRaw">Markdown</button>
+            <a class="ghost-button download-button" id="downloadDocument" href="#" download="持股个股复盘.md">下载</a>
+          </div>
+        </div>
+        <article class="markdown-body" id="documentOutput">
+          <p class="empty-state">任务完成后，最终复盘将显示在这里。</p>
+        </article>
+        <pre class="markdown-raw hidden" id="documentRaw"></pre>
+      </section>
+
+      <footer class="app-footer">
+        <span>本地 API 默认地址：<code>http://127.0.0.1:8787</code></span>
+        <span>执行过程中请保持后端服务与东方财富登录态可用。</span>
+      </footer>
+    </div>
+
+    <div class="toast" id="toast" role="status" aria-live="polite"></div>
+    <script src="./app.js"></script>
+  </body>
+</html>

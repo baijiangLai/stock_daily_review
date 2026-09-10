@@ -145,6 +145,21 @@ screenshots/YYYY/MM/DD/workflow_state.json
 详细状态字段和集成方式见 `docs/review-workflow.md`。
 前后端 HTTP API、OpenAPI 和 TypeScript 示例见 `docs/review-workflow-api.md`。
 
+## 前端
+
+项目包含一个零 npm 依赖的静态前端：
+
+```bash
+# 终端 1：启动后端
+.venv/bin/python -m review_workflow serve --port 8787
+
+# 终端 2：启动前端
+cd frontend
+npm run dev
+```
+
+然后访问 `http://127.0.0.1:5173`，在页面中输入持仓并点击“一键自动复盘”。
+
 > `--date` 只用于目录整理和复盘标题；东方财富页面仍返回打开页面当时的最新行情。如果周末复盘周五，请以截图中的行情日期为准。
 > 批量模式的 `--board` 会应用到所有持仓，并且必须按顺序提供 `一级行业`、`核心板块`、`细分方向` 三个板块。多持仓时建议省略该参数让每只股票自动推断；确需强制指定时，更适合对单只股票执行 `run_daily_review.py`。
 > `--skip-capture` / `--dry-run` 会严格校验 4 张个股截图、三个板块截图和主板块资金流/成分股截图；缺失时不会降级调用模型。
