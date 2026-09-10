@@ -1,0 +1,52 @@
+# API keys and local environment configuration
+.env
+.env.*
+!.env.example
+!.env.template
+*.key
+*.pem
+*.p12
+*.pfx
+*.crt
+*.cer
+*.jks
+*.keystore
+*.token
+*secret*
+*credential*
+*apikey*
+*api_key*
+*service-account*.json
+
+# Browser login states and cookies
+.auth/
+.playwright/
+*storage_state*.json
+*cookies*.json
+*cookie*.json
+*session*.json
+
+# Private portfolio inputs and generated review artifacts
+my_stock.txt
+*my_stock*.txt
+img.png
+screenshots/
+workflow_state.json
+workflow_state_*.json
+*_持股个股复盘.md
+*当日复盘.md
+
+# Python/runtime artifacts
+__pycache__/
+.pycache/
+.venv/
+.pip-cache/
+.clang-cache/
+.pytest_cache/
+.coverage
+htmlcov/
+*.log
+.DS_Store
+
+# Local IDE configuration
+.idea/
