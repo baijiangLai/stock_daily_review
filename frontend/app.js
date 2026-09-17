@@ -4,10 +4,10 @@ const statusLabels = {
   pending: "等待处理",
   capturing: "抓取截图",
   captured: "截图完成",
-  analyzing: "AI 复盘中",
+  analyzing: "复盘中",
   analyzed: "复盘完成",
   capture_failed: "截图失败",
-  analysis_failed: "AI 失败",
+  analysis_failed: "复盘失败",
 };
 const workflowLabels = {
   running: "执行中",
@@ -17,7 +17,7 @@ const workflowLabels = {
 };
 const stageLabels = {
   capture: "截图",
-  analyze: "AI 复盘",
+  analyze: "个股复盘",
   summary: "组合摘要",
   render: "文档渲染",
   done: "完成",
@@ -41,6 +41,7 @@ const elements = {
   addHolding: document.getElementById("addHolding"),
   forceRun: document.getElementById("forceRun"),
   apiBase: document.getElementById("apiBase"),
+  reviewProvider: document.getElementById("reviewProvider"),
   form: document.getElementById("reviewForm"),
   startRun: document.getElementById("startRun"),
   resumeRun: document.getElementById("resumeRun"),
@@ -224,6 +225,7 @@ async function createAutomaticRun(event) {
       body: JSON.stringify({
         date,
         holdings,
+        provider: elements.reviewProvider.value,
         execute: true,
         force: elements.forceRun.checked,
       }),
@@ -250,7 +252,11 @@ async function resumeFailedTasks() {
     setBusy(true, "正在恢复失败任务...");
     const result = await request(`/api/review-runs/${state.reviewDate}/resume`, {
       method: "POST",
-      body: JSON.stringify({ retry_failed: true, execute: true }),
+      body: JSON.stringify({
+        retry_failed: true,
+        execute: true,
+        provider: elements.reviewProvider.value,
+      }),
     });
     renderStatus(result);
     startPolling();

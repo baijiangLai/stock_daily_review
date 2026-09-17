@@ -13,7 +13,7 @@
         <div>
           <p class="eyebrow">Daily Review Terminal</p>
           <h1>持股复盘控制台</h1>
-          <p class="subtitle">输入持仓，自动完成截图、AI 复盘、组合摘要与文档输出。</p>
+          <p class="subtitle">输入持仓，自动完成截图、本地规则/AI 复盘、组合摘要与文档输出。</p>
         </div>
         <div class="header-status" id="healthStatus" aria-live="polite">
           <span class="health-dot" id="healthDot"></span>
@@ -57,6 +57,16 @@
               <input id="apiBase" type="url" spellcheck="false" autocomplete="url" />
             </div>
 
+            <div class="api-field">
+              <label for="reviewProvider">复盘引擎</label>
+              <select id="reviewProvider">
+                <option value="local" selected>本地规则（不调用 Gemini/智谱）</option>
+                <option value="auto">AI 模型（auto）</option>
+                <option value="gemini">Gemini</option>
+                <option value="zhipu">智谱</option>
+              </select>
+            </div>
+
             <div class="action-stack">
               <button type="submit" class="primary-button" id="startRun">一键自动复盘</button>
               <div class="secondary-actions">
@@ -88,7 +98,7 @@
           </div>
 
           <div class="task-list" id="taskList">
-            <div class="empty-state">创建任务后，这里将显示每只股票的截图与 AI 状态。</div>
+            <div class="empty-state">创建任务后，这里将显示每只股票的截图与复盘状态。</div>
           </div>
 
           <div class="event-log">

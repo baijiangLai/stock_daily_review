@@ -98,6 +98,24 @@ def _can_bind_local_port() -> bool:
 
 
 class ReviewWorkflowTest(unittest.TestCase):
+    def test_api_accepts_local_provider(self) -> None:
+        config = config_from_payload(
+            {
+                "date": "2026-09-10",
+                "provider": "local",
+                "holdings": [
+                    {
+                        "name": "示例股票A",
+                        "cost": 10,
+                        "shares": 100,
+                        "plan": "1年之内",
+                    }
+                ],
+            }
+        )
+
+        self.assertEqual(config.provider, "local")
+
     def test_document_renderer_preserves_reviews_and_failures(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             review_path = Path(directory) / "fake当日复盘.md"

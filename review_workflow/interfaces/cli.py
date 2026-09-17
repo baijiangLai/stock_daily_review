@@ -24,7 +24,11 @@ def _add_common_options(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--template", default=str(PROJECT_ROOT / "个股复盘模板内容.md"))
     parser.add_argument("--output", help="最终 Markdown 输出路径")
     parser.add_argument("--state-file", help="工作流状态 JSON 路径")
-    parser.add_argument("--provider", default="auto", choices=["auto", "gemini", "zhipu"])
+    parser.add_argument(
+        "--provider",
+        default="auto",
+        choices=["auto", "gemini", "zhipu", "local"],
+    )
     parser.add_argument("--model")
     parser.add_argument(
         "--search-provider",

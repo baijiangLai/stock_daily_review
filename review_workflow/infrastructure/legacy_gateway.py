@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 from datetime import date
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Sequence
@@ -13,6 +14,10 @@ from eastmoney_auth import load_auth_state
 from review_workflow.domain.config import WorkflowConfig
 
 from ..application.ports import AnalysisResult, CaptureResult, RuntimeInfo
+from .local_review import (
+    generate_local_stock_review,
+    generate_portfolio_summary as generate_local_portfolio_summary,
+)
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -74,6 +79,37 @@ class LegacyPortfolioGateway:
         stock_dir: Path,
         config: WorkflowConfig,
     ) -> AnalysisResult:
+        if config.provider == "local":
+            _, review_path = generate_local_stock_review(
+                holding, stock_dir, config.to_dict()
+            )
+            stock = json.loads((stock_dir / "metadata.json").read_text(encoding="utf-8"))[
+                "resolved_stock"
+            ]
+            individual_count = sum(
+                path.is_file()
+                for path in (
+                    stock_dir / "01_trading_data.png",
+                    stock_dir / "02_intraday_chart.png",
+                    stock_dir / "03_bid_ask_5.png",
+                    stock_dir / "04_daily_kline.png",
+                )
+            )
+            boards = json.loads(
+                (stock_dir / "boards_metadata.json").read_text(encoding="utf-8")
+            ).get("boards", {})
+            board_count = sum(
+                len(info.get("screenshots", {}))
+                for info in boards.values()
+                if isinstance(info, dict)
+            )
+            return AnalysisResult(
+                stock=stock,
+                individual_images=individual_count,
+                board_images=board_count,
+                review_path=review_path,
+            )
+
         template = config.template_file.read_text(encoding="utf-8")
         stock, individual_images, board_images, _ = portfolio.review_one_stock(
             portfolio.Holding(**dict(holding)),
@@ -98,6 +134,9 @@ class LegacyPortfolioGateway:
         reviews: Sequence[Mapping[str, Any]],
         config: WorkflowConfig,
     ) -> str:
+        if config.provider == "local":
+            return generate_local_portfolio_summary(review_date, reviews, config.timeout)
+
         legacy_reviews = []
         for item in reviews:
             legacy_reviews.append(
@@ -121,6 +160,24 @@ class LegacyPortfolioGateway:
         )
 
     def runtime_info(self, config: WorkflowConfig) -> RuntimeInfo:
+        if config.provider == "local":
+            date_root = self._date_root(config.review_date)
+            output_path = (
+                config.output_file
+                if config.output_file
+                else portfolio.default_daily_output(
+                    date_root,
+                    self.parse_review_date(config.review_date),
+                )
+            )
+            return RuntimeInfo(
+                provider="local",
+                model="local-rule-engine-v1",
+                search_provider="none" if config.no_web_search else "eastmoney-public-api",
+                date_root=date_root,
+                output_path=output_path,
+            )
+
         provider = portfolio.resolve_provider(config.provider, config.model)
         model = portfolio.resolve_model(config.model, provider)
         search_provider = portfolio.resolve_search_provider(

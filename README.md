@@ -1,53 +1,214 @@
-# stock-preview
+# Stock Daily Review
 
-第一步：根据股票名称或代码，从东方财富行情页截取指定数据。
+Stock Daily Review 是一个运行在本机的 A 股个人持仓自动复盘工作台。你只需要输入股票名称或代码、成本价、持股数量和计划持有周期，系统会自动完成：
 
-## 安装
+1. 打开东方财富行情页并截取个股交易数据、分时图、五档盘口、日 K 线；
+2. 识别并截取所属行业/板块数据；
+3. 可选 Gemini / 智谱多模态复盘，或使用不依赖模型 Key 的本地规则复盘；
+4. 生成每只股票的个股复盘、组合级摘要和最终 Markdown 文档；
+5. 通过本地前端展示执行进度、失败原因、复盘内容和下载入口。
+
+项目重点是**可恢复、可观测、可审计**：每一步都会落盘，模型配额耗尽或网络中断后，不需要重新截图，可以从断点继续。
+
+> 本项目输出内容仅用于个人研究、复盘和信息整理，不构成投资建议。模型可能出错，交易前请自行核实关键数据。
+
+---
+
+## 目录
+
+- [核心能力](#核心能力)
+- [项目结构](#项目结构)
+- [快速启动](#快速启动)
+- [前端使用](#前端使用)
+- [命令行使用](#命令行使用)
+- [自动复盘流程](#自动复盘流程)
+- [输出结果](#输出结果)
+- [HTTP API 概览](#http-api-概览)
+- [失败恢复](#失败恢复)
+- [安全与隐私](#安全与隐私)
+- [测试](#测试)
+- [常见问题](#常见问题)
+
+---
+
+## 核心能力
+
+| 能力 | 说明 |
+| --- | --- |
+| 持仓输入 | 前端表单输入，或 CLI 读取 `my_stock.txt` |
+| 行情截图 | 自动解析股票名称/代码，抓取东方财富个股与板块数据 |
+| 多模态 AI 复盘 | 将截图和持仓信息交给 Gemini / 智谱模型，生成技术面、板块、大事和仓位计划 |
+| 本地规则复盘 | 不调用 Gemini / 智谱，基于搜狐与东方财富公开接口计算盈亏、均线、RSI、量能、板块和组合风险 |
+| 动态信息检索 | 支持智谱 Web Search 或模型内置搜索，并在复盘中附带来源 |
+| 组合摘要 | 汇总多只个股复盘，生成组合级别观察和风险提示 |
+| 可恢复工作流 | 每只股票独立记录截图/AI 状态，失败后可断点重试 |
+| 前端控制台 | 一键自动复盘、轮询进度、查看事件流、阅读或下载 Markdown |
+| 本地 API | 提供健康检查、创建任务、查询状态、重试、渲染和获取文档接口 |
+
+---
+
+## 项目结构
+
+后端采用分层架构，业务规则、应用编排、基础设施适配和接口协议分离：
+
+```text
+.
+├── review_workflow/
+│   ├── domain/            # 领域模型、配置、最终 Markdown 渲染器
+│   ├── application/       # Workflow Agent、应用服务、端口定义
+│   ├── infrastructure/    # JSON 状态存储、旧脚本适配器
+│   └── interfaces/        # CLI、HTTP API、OpenAPI
+├── frontend/              # 零 npm 依赖的静态前端
+├── docs/
+│   ├── review-workflow.md       # 工作流状态与集成说明
+│   └── review-workflow-api.md   # HTTP API 详细文档
+├── tests/                 # 单元测试
+├── capture_eastmoney.py   # 东方财富截图与登录工具
+├── portfolio_daily_review.py    # 一键批量复盘旧入口
+├── run_daily_review.py     # 基于已有截图生成单股复盘
+├── my_stock.txt.example   # CLI 持仓文件示例
+└── 个股复盘模板内容.md      # AI 输出模板
+```
+
+推荐新用户使用 `review_workflow` + `frontend`。根目录其他脚本是独立工具或兼容旧流程的入口。
+
+---
+
+## 快速启动
+
+### 1. 环境要求
+
+- Python 3.10+
+- 本机已安装 Google Chrome
+- Node.js / npm 仅用于启动静态服务器；前端本身没有 npm 依赖
+- 使用 `provider=local` 时无需模型 API Key；
+- 使用 AI 复盘时至少配置一个模型 API Key：
+   - Gemini `GEMINI_API_KEY` / `GOOGLE_API_KEY`
+   - 或智谱 `ZHIPU_API_KEY`
+
+### 2. 安装依赖
 
 ```bash
-python -m venv .venv
+git clone git@github.com:baijiangLai/stock_daily_review.git
+cd stock_daily_review
+
+python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-脚本默认使用本机已安装的 Google Chrome，无需额外下载浏览器。
+如果仍在当前仓库目录中开发，直接执行后三行即可。
 
-## 东方财富扫码登录
+### 3. 配置模型 Key
 
-东方财富部分行情/盘口内容需要登录态。首次使用或截图数据为空时，先执行：
-
-```bash
-python capture_eastmoney.py --login
-```
-
-在打开的浏览器里点击“登录”，选择扫码登录。确认页面右上角显示账号信息后，回到终端输入 `yes` 保存。登录状态保存在本机 `.auth/eastmoney-state.json`，后续个股截图会自动复用；该文件包含登录 Cookie，请勿提交或分享。
-
-## 使用
+在项目根目录创建 `.env`：
 
 ```bash
-python capture_eastmoney.py 贵州茅台
-# 或
-python capture_eastmoney.py 600519
+cat > .env <<'EOF'
+# 二选一，也可以同时配置
+ZHIPU_API_KEY=你的智谱APIKey
+# GEMINI_API_KEY=你的GeminiAPIKey
+EOF
+
+chmod 600 .env
 ```
 
-如需观察浏览器操作过程：
+说明：
+
+- `provider=auto` 仍表示 AI 模型，当前优先使用 Gemini，仅有智谱 Key 时使用智谱；
+- 想完全不调用 Gemini / 智谱，请显式使用 `provider=local`。
+- 有智谱 Key 时，动态信息默认优先走智谱独立 Web Search；也可以通过参数改为模型内置搜索。
+- 如本机需要代理访问模型 API，可在 `.env` 中追加：
+
+```text
+HTTPS_PROXY=http://127.0.0.1:7890
+HTTP_PROXY=http://127.0.0.1:7890
+NO_PROXY=localhost,127.0.0.1
+```
+
+### 4. 登录东方财富
+
+部分行情、盘口和板块页面需要登录态。首次使用或截图数据为空时执行：
 
 ```bash
-python capture_eastmoney.py 600519 --headed
+.venv/bin/python capture_eastmoney.py --login
 ```
 
-截图会保存到 `screenshots/股票名_代码_时间戳/`，包含：
+在打开的 Chrome 中完成扫码登录，确认页面右上角显示账号信息后，回到终端输入 `yes` 保存。
 
-1. `01_trading_data.png`：当日交易数据面板
-2. `02_intraday_chart.png`：日内分时走势图
-3. `03_bid_ask_5.png`：买卖五档盘口
-4. `04_daily_kline.png`：日 K 线图
+登录态会保存到：
 
-`metadata.json` 会记录输入值、解析后的股票代码、行情页地址和截图清单。
+```text
+.auth/eastmoney-state.json
+```
 
-## 批量整日持股复盘
+该文件包含 Cookie，只保存在本机，严禁提交或分享。
 
-先创建自己的持仓文件（示例见 `my_stock.txt.example`）：
+### 5. 启动后端 API
+
+```bash
+.venv/bin/python -m review_workflow serve --host 127.0.0.1 --port 8787
+```
+
+检查服务：
+
+```bash
+curl http://127.0.0.1:8787/api/health
+```
+
+正常返回：
+
+```json
+{
+  "ok": true,
+  "service": "review-workflow"
+}
+```
+
+---
+
+## 前端使用
+
+保持后端终端运行，再打开一个终端：
+
+```bash
+cd frontend
+npm run dev
+```
+
+访问：
+
+```text
+http://127.0.0.1:5173
+```
+
+如果没有 npm，也可以直接用 Python 静态服务器：
+
+```bash
+cd frontend
+python3 -m http.server 5173
+```
+
+### 页面操作流程
+
+1. 选择复盘日期；
+2. 输入股票名称或 6 位代码；
+3. 填写成本价、持股数量；
+4. 选择计划周期：`3个月内`、`6个月内`、`1年之内`、`3年之内`、`5年之内`；
+5. 可继续点击“增加持仓”添加多只股票；
+6. 点击“一键自动复盘”；
+7. 前端每 2 秒轮询一次后端状态；
+8. 任务完成后，在页面底部阅读、切换 Markdown 源码或下载最终文档。
+
+如果同一天已有任务，需要勾选“覆盖同日已有任务”才会重新创建。配额或网络恢复后，可以点击“重试失败项”。
+
+---
+
+## 命令行使用
+
+### 1. 准备持仓文件
+
+CLI 模式默认读取项目根目录的 `my_stock.txt`：
 
 ```bash
 cp my_stock.txt.example my_stock.txt
@@ -56,198 +217,325 @@ cp my_stock.txt.example my_stock.txt
 格式为每行一只股票：
 
 ```text
-股票名称,成本,持股数,计划持有时间
+# 股票名称或代码,成本价,持股数量,计划持有时间
+贵州茅台,1500,100,1年之内
+平安银行,10.50,2000,6个月内
 ```
 
-登录东方财富后，生成指定日期的整日复盘：
+`my_stock.txt` 包含个人持仓信息，已被 `.gitignore` 忽略。
+
+### 2. 创建并执行复盘
 
 ```bash
-python portfolio_daily_review.py --date 2026-08-28
+# 初始化工作流，不立即执行
+.venv/bin/python -m review_workflow start --date 2026-09-11
+
+# 初始化并自动执行到终态
+.venv/bin/python -m review_workflow start --date 2026-09-11 --execute
+
+# 指定 Gemini 和模型内置搜索
+.venv/bin/python -m review_workflow start \
+  --date 2026-09-11 \
+  --provider gemini \
+  --search-provider model \
+  --execute
+
+# 本地规则复盘：不调用 Gemini / 智谱，不需要模型 Key
+.venv/bin/python -m review_workflow start \
+  --date 2026-09-11 \
+  --provider local \
+  --execute
+
+# 如果希望固定覆盖根目录《每日复盘.md》：
+.venv/bin/python -m review_workflow start \
+  --date 2026-09-11 \
+  --provider local \
+  --output "$PWD/每日复盘.md" \
+  --execute
 ```
 
-默认会先检查 `screenshots/年/月/日/` 下是否已有该股票的完整个股与板块截图；存在时不重新截图，直接复用并继续生成复盘。只有截图缺失或不完整时才归档旧目录并重抓。
-
-截图会按日期整理到：
-
-```text
-screenshots/年/月/日/股票名称_股票代码/
-```
-
-每只股票会生成：
-
-- 4 张个股截图
-- 所属板块截图与 `boards_metadata.json`
-- `zhipu当日复盘.md` 或 `gemini当日复盘.md`
-
-最后在日期目录下生成：
-
-```text
-YYYYMMDD_持股个股复盘.md
-```
-
-常用参数：
+### 3. 查询与输出
 
 ```bash
-# 复用当天已有截图，只重新调用 AI 模型
-python portfolio_daily_review.py --date 2026-08-28 --skip-capture
-
-# 只抓取当天个股与板块截图，不调用模型、不生成 Markdown
-python portfolio_daily_review.py --date 2026-08-28 --capture-only
-
-# 只读检查当天已有截图与提示词清单；不联网、不写文件、不调用模型
-python portfolio_daily_review.py --date 2026-08-28 --dry-run
-
-# 旧截图已存在时归档并重新截图
-python portfolio_daily_review.py --date 2026-08-28 --recapture
-```
-
-## 可恢复的 Agent Workflow
-
-如果希望后续接入前端或任务队列，可以使用 `review_workflow`。它把批量复盘拆成
-“个股截图 → 个股 AI 复盘 → 组合摘要 → 最终文档渲染”的原子步骤，并将状态保存到：
-
-```text
-screenshots/YYYY/MM/DD/workflow_state.json
-```
-
-常用命令：
-
-```bash
-# 初始化工作流
-.venv/bin/python -m review_workflow start --date 2026-09-10
-
-# 初始化并执行到终态
-.venv/bin/python -m review_workflow start --date 2026-09-10 --execute
-
 # 查看 JSON 状态
-.venv/bin/python -m review_workflow status --date 2026-09-10
-
-# API 配额恢复后，从断点重试失败股票
-.venv/bin/python -m review_workflow resume --date 2026-09-10 --execute
-
-# 只重渲染最终 Markdown，不调用模型
-.venv/bin/python -m review_workflow render --date 2026-09-10
+.venv/bin/python -m review_workflow status --date 2026-09-11
 
 # 输出最终 Markdown
-.venv/bin/python -m review_workflow document --date 2026-09-10
+.venv/bin/python -m review_workflow document --date 2026-09-11
 
-# 启动前后端对接 API；前端可在 /api/review-runs 中提交用户输入的 holdings
-.venv/bin/python -m review_workflow serve --port 8787
+# 只根据已生成的个股复盘重新渲染最终文档，不调用模型
+.venv/bin/python -m review_workflow render --date 2026-09-11
 ```
 
-该模式的特点：
+### 4. 常用参数
 
-- 截图、板块数据、个股复盘和最终文档分阶段落盘。
-- 单只股票失败不影响其他股票继续执行。
-- 全部模型调用失败时，仍会输出包含失败原因的最终文档。
-- 前端可以轮询状态 JSON，或由后端 worker 每次调用一个 `step()`。
+| 参数 | 说明 |
+| --- | --- |
+| `--provider auto/gemini/zhipu/local` | 选择复盘引擎；`local` 不调用模型 API |
+| `--model 模型名` | 指定具体模型 |
+| `--search-provider auto/zhipu/model/none` | 选择动态信息搜索方式 |
+| `--timeout 秒数` | 页面和模型请求超时时间 |
+| `--headed` | 显示浏览器，便于调试 |
+| `--skip-capture` | 复用当天已有截图，只继续本地/AI 分析 |
+| `--recapture` | 截图已存在时归档旧图并重抓 |
+| `--no-web-search` | 不联网检索，动态字段标记为待核实 |
+| `--no-peer-capture` | 不生成核心个股交易数据表 |
+| `--force` | 覆盖同日期已有工作流状态，重新开始 |
 
-详细状态字段和集成方式见 `docs/review-workflow.md`。
-前后端 HTTP API、OpenAPI 和 TypeScript 示例见 `docs/review-workflow-api.md`。
+### 5. 其他入口
 
-## 前端
+| 命令 | 用途 |
+| --- | --- |
+| `.venv/bin/python capture_eastmoney.py 贵州茅台` | 抓取单只股票截图 |
+| `.venv/bin/python capture_eastmoney.py 600519 --headed` | 有头模式调试截图 |
+| `.venv/bin/python portfolio_daily_review.py --date YYYY-MM-DD` | 旧版一键批量复盘 |
+| `.venv/bin/python run_daily_review.py` | 基于最新截图生成单股复盘 |
 
-项目包含一个零 npm 依赖的静态前端：
+更完整的参数和设计说明见：
 
-```bash
-# 终端 1：启动后端
-.venv/bin/python -m review_workflow serve --port 8787
+- [`docs/review-workflow.md`](docs/review-workflow.md)
+- [`docs/review-workflow-api.md`](docs/review-workflow-api.md)
 
-# 终端 2：启动前端
-cd frontend
-npm run dev
+---
+
+## 自动复盘流程
+
+### 总体流程图
+
+```mermaid
+flowchart LR
+    A[用户输入持仓] --> B[创建 Workflow 状态]
+    B --> C[逐只股票截图]
+    C --> D[解析代码与所属板块]
+    D --> E[保存个股/板块截图与 metadata]
+    E --> F[组装多模态提示词]
+    F --> G[联网检索动态信息]
+    G --> H[AI 生成个股复盘]
+    H --> I{还有下一只股票?}
+    I -- 是 --> C
+    I -- 否 --> J[生成组合级摘要]
+    J --> K[渲染最终 Markdown]
+    K --> L[前端展示/下载]
 ```
 
-然后访问 `http://127.0.0.1:5173`，在页面中输入持仓并点击“一键自动复盘”。
+### 阶段说明
 
-> `--date` 只用于目录整理和复盘标题；东方财富页面仍返回打开页面当时的最新行情。如果周末复盘周五，请以截图中的行情日期为准。
-> 批量模式的 `--board` 会应用到所有持仓，并且必须按顺序提供 `一级行业`、`核心板块`、`细分方向` 三个板块。多持仓时建议省略该参数让每只股票自动推断；确需强制指定时，更适合对单只股票执行 `run_daily_review.py`。
-> `--skip-capture` / `--dry-run` 会严格校验 4 张个股截图、三个板块截图和主板块资金流/成分股截图；缺失时不会降级调用模型。
+1. **创建任务**
+   - 前端提交 `date + holdings`；
+   - 后端校验股票名、成本、数量和持有周期；
+   - 生成 `workflow_state.json`，同一天只允许一个工作流。
 
-## AI 当日复盘
+2. **个股截图**
+   - 根据名称或代码解析东方财富标的；
+   - 抓取交易数据、分时图、五档盘口、日 K 线；
+   - 识别并抓取一级行业、核心板块、细分方向等截图；
+   - 写入 `metadata.json` 和 `boards_metadata.json`。
 
-先生成个股截图，再在项目根目录 `.env` 中设置 API Key。当前支持智谱与 Gemini；`--provider auto` 检测到 `ZHIPU_API_KEY` 时会优先使用智谱，否则使用 Gemini。
+3. **个股复盘**
+   - 读取复盘模板；
+   - 将个股截图、板块截图、持仓成本、持股数量、计划周期组装成多模态请求；
+   - 通过搜索核实财报、事件、政策、板块涨跌原因等动态信息；
+   - AI 模式输出 `gemini当日复盘.md` / `zhipu当日复盘.md`；
+   - 本地规则模式输出 `local当日复盘.md` 与 `local_review_data.json`。
 
-```bash
-cp /dev/null .env
-chmod 600 .env
-echo 'ZHIPU_API_KEY=你的智谱 API Key' >> .env
-# 或
-echo 'GEMINI_API_KEY=你的 Gemini API Key' >> .env
-```
+`provider=local` 的数据路径：
 
-智谱使用官方 `https://open.bigmodel.cn/api/paas/v4/chat/completions` 多模态对话接口，默认模型 `glm-5.3-flash`。如需自定义智谱接口地址，可设置 `ZHIPU_BASE_URL`。
+1. 搜狐公开日线计算 OHLC、成交额、换手率、MA5/10/20/60、RSI6/12/24 和量能倍数；
+2. 东方财富公开接口补充估值、板块、最新财报、公告和新闻线索；
+3. 按持仓成本与股数计算市值、浮动盈亏、当日盈亏、权重和规则化压力/支撑；
+4. 汇总生成组合摘要、集中度、弱趋势与高换手风险。
 
-动态信息默认优先调用智谱独立的 Web Search API：
+> 建议在交易日收盘后执行 `provider=local`。估值与板块来自东方财富实时快照，程序会校验快照日期；如果次日补跑历史日期，相关字段会标记为“待核实”，不会把最新快照误写成复盘日数据。
+
+4. **组合摘要**
+   - 读取所有成功生成的个股复盘；
+   - 综合持仓权重、盈亏、板块暴露和风险点；
+   - 生成组合级观察与交易计划。
+
+5. **最终渲染**
+   - 合并持仓总览、执行状态、组合摘要、个股完整复盘；
+   - 生成 `YYYYMMDD_持股个股复盘.md`；
+   - 前端通过 API 读取并渲染。
+
+### 工作流状态
+
+| 状态 | 含义 |
+| --- | --- |
+| `running` | 正在执行 |
+| `completed` | 全部个股复盘成功 |
+| `partial_completed` | 部分成功、部分失败 |
+| `failed` | 全部失败或工作流异常终止 |
+
+每只股票还有独立状态：`pending`、`capturing`、`captured`、`analyzing`、`analyzed`、`capture_failed`、`analysis_failed`。
+
+---
+
+## 输出结果
+
+以 2026-09-11 为例：
 
 ```text
-POST https://open.bigmodel.cn/api/paas/v4/web_search
-search_engine=search_std
+screenshots/
+└── 2026/
+    └── 09/
+        └── 11/
+            ├── workflow_state.json
+            ├── 20260911_持股个股复盘.md
+            └── 股票名称_股票代码/
+                ├── 01_trading_data.png
+                ├── 02_intraday_chart.png
+                ├── 03_bid_ask_5.png
+                ├── 04_daily_kline.png
+                ├── boards_metadata.json
+                └── gemini当日复盘.md 或 local当日复盘.md
 ```
 
-搜索结果会作为带标题、链接、媒体、发布时间和摘要的文本证据提供给复盘模型，并在复盘末尾自动附加来源列表。这样可以组合使用“智谱 search_std 搜索 + Gemini 读截图生成”，避免消耗 Gemini Google Search grounding 配额。
+主要产物：
 
-脚本会自动读取项目根目录的 `.env`；也可以继续使用环境变量 `ZHIPU_API_KEY`、`GEMINI_API_KEY` 或 `GOOGLE_API_KEY`。
+- `workflow_state.json`：可恢复状态、事件流、每只股票的阶段和错误；
+- 个股截图：用于审计模型看到的数据；
+- 个股复盘 Markdown：技术面、板块、大事、仓位计划；
+- 最终复盘 Markdown：组合总览 + 摘要 + 个股完整复盘 + 失败原因。
 
-为最新一组个股截图补充板块截图，并直接生成复盘：
+---
+
+## HTTP API 概览
+
+后端默认地址是 `http://127.0.0.1:8787`。
+
+| 方法 | 路径 | 说明 |
+| --- | --- | --- |
+| `GET` | `/api/health` | 健康检查 |
+| `GET` | `/api/openapi` | 获取 OpenAPI schema |
+| `POST` | `/api/review-runs` | 创建工作流；`execute=true` 时后台自动执行 |
+| `GET` | `/api/review-runs/{date}` | 查询状态和进度 |
+| `POST` | `/api/review-runs/{date}/steps` | 手动执行一个原子步骤 |
+| `POST` | `/api/review-runs/{date}/resume` | 断点恢复或重试失败项 |
+| `POST` | `/api/review-runs/{date}/render` | 重新渲染最终 Markdown |
+| `GET` | `/api/review-runs/{date}/document` | 获取最终 Markdown |
+
+创建任务示例：
 
 ```bash
-python run_daily_review.py
+curl -X POST http://127.0.0.1:8787/api/review-runs \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "date": "2026-09-11",
+    "holdings": [
+      {
+        "name": "600519",
+        "cost": 1500,
+        "shares": 100,
+        "plan": "1年之内"
+      }
+    ],
+    "provider": "local",
+    "search_provider": "auto",
+    "execute": true
+  }'
 ```
 
-也可以指定某个截图目录、板块、服务商和模型：
+完整字段、错误码和 TypeScript 示例见 [`docs/review-workflow-api.md`](docs/review-workflow-api.md)。
+
+---
+
+## 失败恢复
+
+常见失败包括东方财富登录态过期、页面结构变化、模型超时、API 配额耗尽、搜索接口失败等。
+
+### 查看原因
 
 ```bash
-python run_daily_review.py screenshots/平安银行_000001_20260830_155334 \
-  --board 一级行业:BK1283 \
-  --board 核心板块:BK0475 \
-  --board 细分方向:BK1610 \
-  --provider gemini \
-  --model gemini-3.6-flash \
-  --search-provider zhipu
+.venv/bin/python -m review_workflow status --date 2026-09-11
 ```
 
-脚本会按“当前数据截图 → 技术面分析 → 板块截图 → 板块分析 → 大事/仓位计划”的结构组织多模态提示词，并将复盘保存为截图目录下的 `zhipu当日复盘.md` 或 `gemini当日复盘.md`。板块截图会记录在 `boards_metadata.json` 中。
+状态中的 `stocks[].error` 和 `events` 会记录具体失败阶段。
 
-个股复盘请求会按 `--search-provider` 获取动态信息：默认有 `ZHIPU_API_KEY` 时使用智谱 Web Search（`search_std`），没有智谱 Key 时使用模型内置搜索。截图主要用于支撑股票与板块的价格、量能、分时/K线形态和关键技术位；板块涨跌原因、近期大事、财报、公司事件、行业事件、政策与宏观事件等动态事实必须由检索证据核实，并在正文中标注来源和日期。检索网页来源会自动附加到复盘末尾，便于复查。
-
-工程机械板块还会自动补充“龙头/核心个股交易数据表”：先用 Gemini 无联网对话提名三一重工、徐工机械、中联重科、柳工、恒立液压、浙江鼎力、杭叉集团、安徽合力、山推股份等候选，再调用东方财富历史日线接口获取复盘日的开盘、收盘、最高、最低、涨跌幅、成交量、成交额和换手率，生成 `core_peers/日期_core_peers_trading_data.png` 后交给模型。因此“板块龙头/核心个股表现”可以基于真实日内数据填写，但统计口径是候选池比较，不等同于全板块涨幅排行榜。
-
-常用搜索参数：
+### 从断点恢复
 
 ```bash
-# 智谱独立 Web Search + Gemini 读图
---search-provider zhipu
+# 重试失败股票并执行到终态
+.venv/bin/python -m review_workflow resume --date 2026-09-11 --execute
 
-# 模型内置搜索（Gemini 为 Google Search，智谱为对话内 web_search）
---search-provider model
-
-# 不检索；动态字段明确写“待核实”
---no-web-search
-
-# 手动指定其他板块的核心个股，可重复传入
---peer-stock 三一重工:600031 --peer-stock 徐工机械:000425
-
-# 不抓取核心个股交易数据表
---no-peer-capture
+# 只复用已有截图，不重新截图
+.venv/bin/python -m review_workflow resume \
+  --date 2026-09-11 \
+  --skip-capture \
+  --execute
 ```
 
-## AI 分段提示词
+恢复规则：
 
-批量复盘会在一次多模态请求中按资料可用性分段组织提示词：
+- `capture_failed`：重新尝试截图；
+- `analysis_failed`：保留截图，只重试 AI 复盘；
+- `analyzed`：不重复调用模型，直接复用已有 Markdown；
+- 全部失败时，最终文档仍会渲染失败清单，便于定位。
 
-1. 先提供个股当日交易数据、分时图、五档盘口与日 K 线，让模型先完成“二、 技术面与量价状态”：均线形态、关键位置、第一/第二支撑位、第一/第二压力位、量价资金特征、成交量与主力意图。
-2. 再提供一级行业、核心板块、细分方向截图，让模型完成“一、 板块”；截图负责走势与形态。若提供了核心个股历史交易数据表，板块龙头和核心个股表现优先从该表读取；涨跌原因和相对大盘等仍需检索核实。
-3. 最后综合前两段结论与 `my_stock.txt` 的成本、持股数、计划持有时间，并通过联网搜索填写“三、 近期大事”和“四、 仓位管理与计划交易”。
+---
 
-最终 Markdown 仍按模板原始顺序输出。截图和检索都不能核实的信息会明确写“待核实”，不会让模型用参数记忆虚构。板块资金流与成分股截图仍会抓取作为本地审计材料，但不会发送给模型，避免把一级行业成分股误写成核心板块/细分方向龙头。
+## 安全与隐私
 
-`--skip-capture` 会直接从当日目录的 `metadata.json` 匹配持仓并复用本地截图，不需要再次访问东方财富；单股流程的 `--skip-capture` 也可继续传股票名称或代码。
-
-如果本机不能直连模型 API，可在 `.env` 中追加代理配置（值需替换为自己的代理地址）：
+以下文件包含个人持仓、Cookie 或密钥，均已加入 `.gitignore`，不要提交：
 
 ```text
-HTTPS_PROXY=http://127.0.0.1:7890
-HTTP_PROXY=http://127.0.0.1:7890
-NO_PROXY=localhost,127.0.0.1
+.env
+.auth/
+my_stock.txt
+screenshots/
+workflow_state.json
+*_持股个股复盘.md
+*当日复盘.md
 ```
+
+额外注意：
+
+- `.auth/eastmoney-state.json` 是浏览器登录态，等同于账号 Cookie；
+- `.env` 只保存在本机，不要截图、粘贴或上传；
+- 截图和搜索查询会发送给你选择的模型/搜索服务商；
+- 后端默认绑定 `127.0.0.1`，仅适合本机使用；
+- 如果部署到局域网或公网，必须增加认证、HTTPS、请求限流和权限控制；
+- 自动生成的交易计划必须人工复核，不能直接作为下单依据。
+
+---
+
+## 测试
+
+```bash
+source .venv/bin/activate
+PYTHONPYCACHEPREFIX=$PWD/.pycache python -m unittest discover -s tests -v
+```
+
+前端是纯静态页面，无需构建。修改后刷新浏览器即可。
+
+---
+
+## 常见问题
+
+### 1. 为什么复盘日期和截图里的行情日期不一致？
+
+`--date` 和前端日期主要用于目录整理与文档标题。东方财富页面返回的是打开页面当时的最新行情；如果非交易日运行，页面可能仍显示最近一个交易日。复盘时应以截图内的行情日期为准。
+
+### 2. 已经有截图，如何只重新调用 AI？
+
+```bash
+.venv/bin/python -m review_workflow resume \
+  --date 2026-09-11 \
+  --skip-capture \
+  --execute
+```
+
+### 3. 登录态过期怎么办？
+
+重新执行：
+
+```bash
+.venv/bin/python capture_eastmoney.py --login
+```
+
+### 4. 模型配额耗尽怎么办？
+
+不要连续重试。先查看状态确认截图已经完成，等待配额恢复后执行 `resume --execute`，系统会复用截图。
+
+### 5. 可以直接公网部署吗？
+
+不建议直接部署。当前 API 默认面向本机调试，没有用户认证和权限体系；公网部署前需要增加鉴权、HTTPS、限流、审计和模型 Key 的服务端保护。

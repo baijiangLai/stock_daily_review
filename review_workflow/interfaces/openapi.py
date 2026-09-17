@@ -136,7 +136,10 @@ def openapi_schema() -> Dict[str, Any]:
                     "required": ["date"],
                     "properties": {
                         "date": {"type": "string", "format": "date"},
-                        "provider": {"type": "string", "enum": ["auto", "gemini", "zhipu"]},
+                        "provider": {
+                            "type": "string",
+                            "enum": ["auto", "gemini", "zhipu", "local"],
+                        },
                         "model": {"type": "string"},
                         "search_provider": {
                             "type": "string",

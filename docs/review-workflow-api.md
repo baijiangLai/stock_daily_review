@@ -75,7 +75,7 @@ Content-Type: application/json
       "plan": "6个月内"
     }
   ],
-  "provider": "auto",
+  "provider": "local",
   "model": null,
   "search_provider": "auto",
   "skip_capture": false,
@@ -107,7 +107,7 @@ Content-Type: application/json
 | 字段 | 类型 | 说明 |
 | --- | --- | --- |
 | `date` | string | 必填，`YYYY-MM-DD` |
-| `provider` | string | `auto` / `gemini` / `zhipu` |
+| `provider` | string | `auto` / `gemini` / `zhipu` / `local`；`local` 不调用模型 Key |
 | `model` | string/null | 指定模型 |
 | `search_provider` | string | `auto` / `zhipu` / `model` / `none` |
 | `timeout` | number | 5–3600 秒 |

@@ -48,8 +48,8 @@ def config_from_payload(payload: Dict[str, Any]) -> WorkflowConfig:
         raise ApiError(422, f"date 无效：{exc}") from exc
 
     provider = payload.get("provider", "auto")
-    if provider not in {"auto", "gemini", "zhipu"}:
-        raise ApiError(422, "provider 只支持 auto、gemini、zhipu")
+    if provider not in {"auto", "gemini", "zhipu", "local"}:
+        raise ApiError(422, "provider 只支持 auto、gemini、zhipu、local")
 
     search_provider = payload.get("search_provider", "auto")
     if search_provider not in {"auto", "zhipu", "model", "none"}:

@@ -255,6 +255,7 @@ class WorkflowAgent:
                     {
                         "holding": task.holding,
                         "stock": task.resolved_stock or {},
+                        "review_path": task.review_path,
                         "content": Path(task.review_path).read_text(encoding="utf-8"),
                     }
                 )
