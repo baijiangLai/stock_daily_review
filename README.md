@@ -246,13 +246,15 @@ cp my_stock.txt.example my_stock.txt
   --provider local \
   --execute
 
-# 如果希望固定覆盖根目录《每日复盘.md》：
-.venv/bin/python -m review_workflow start \
-  --date 2026-09-11 \
-  --provider local \
-  --output "$PWD/每日复盘.md" \
-  --execute
 ```
+
+本地规则复盘的最终文档默认固定写入当日目录：
+
+```text
+screenshots/YYYY/MM/DD/YYYYMMDD_持股个股复盘.md
+```
+
+不要在每日执行流程中把复盘文档另存到项目根目录，避免出现旧版《每日复盘.md》覆盖或混淆不同交易日的问题。
 
 ### 3. 查询与输出
 
@@ -354,7 +356,7 @@ flowchart LR
 
 5. **最终渲染**
    - 合并持仓总览、执行状态、组合摘要、个股完整复盘；
-   - 生成 `YYYYMMDD_持股个股复盘.md`；
+   - 固定生成在当日目录：`screenshots/YYYY/MM/DD/YYYYMMDD_持股个股复盘.md`；
    - 前端通过 API 读取并渲染。
 
 ### 工作流状态

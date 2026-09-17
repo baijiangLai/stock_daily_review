@@ -200,11 +200,64 @@ def fetch_stock_history(stock: Mapping[str, Any], review_date: str, timeout: flo
     payload = _request_json(f"{SOHU_HISTORY_API}?{query}", timeout)
     history = parse_sohu_history(payload, review_date)
     if history[-1].date != review_date:
-        raise LocalReviewError(
-            f"搜狐未返回 {stock.get('name', code)} 在 {review_date} 的交易数据；"
-            "请确认当日已收盘或改用交易日复盘"
-        )
+        snapshot = fetch_stock_snapshot_bar(stock, review_date, timeout)
+        if snapshot is None:
+            raise LocalReviewError(
+                f"搜狐未返回 {stock.get('name', code)} 在 {review_date} 的交易数据，"
+                "且东方财富没有匹配复盘日的实时快照"
+            )
+        if history[-1].date >= review_date:
+            raise LocalReviewError(
+                f"{stock.get('name', code)} 的历史行情日期序列异常："
+                f"{history[-1].date} >= {review_date}"
+            )
+        history.append(snapshot)
     return history
+
+
+def fetch_stock_snapshot_bar(
+    stock: Mapping[str, Any], review_date: str, timeout: float
+) -> Optional[DailyBar]:
+    """Fetch an exact-date Eastmoney snapshot for Sohu's lagging daily row."""
+
+    quote_id = str(stock.get("quote_id", "")).strip()
+    code = str(stock.get("code", "")).strip()
+    secid = quote_id or (
+        f"1.{code}" if code.startswith(("6", "9")) else f"0.{code}"
+    )
+    query = urllib.parse.urlencode(
+        {
+            "secid": secid,
+            "fields": ",".join(
+                [
+                    "f43", "f44", "f45", "f46", "f47", "f48",
+                    "f59", "f60", "f86", "f168", "f169", "f170",
+                ]
+            ),
+        }
+    )
+    payload = _request_json(f"{EASTMONEY_QUOTE_API}?{query}", timeout)
+    data = payload.get("data") if isinstance(payload, dict) else None
+    if not isinstance(data, dict) or not _snapshot_is_for_date(data, review_date):
+        return None
+    decimals = int(data.get("f59", 2) or 2)
+    close = _scaled(data.get("f43"), decimals)
+    prev_close = _scaled(data.get("f60"), decimals)
+    if close is None or prev_close is None:
+        return None
+    amount_yuan = _number(data.get("f48"))
+    return DailyBar(
+        date=review_date,
+        open=_scaled(data.get("f46"), decimals) or close,
+        close=close,
+        change=_scaled(data.get("f169"), decimals) or close - prev_close,
+        change_pct=_scaled(data.get("f170"), 2) or 0.0,
+        high=_scaled(data.get("f44"), decimals) or close,
+        low=_scaled(data.get("f45"), decimals) or close,
+        volume_hands=_number(data.get("f47")) or 0.0,
+        amount_wan=amount_yuan / 10000 if amount_yuan is not None else 0.0,
+        turnover_pct=_scaled(data.get("f168"), 2),
+    )
 
 
 def moving_average(values: Sequence[float], period: int) -> Optional[float]:

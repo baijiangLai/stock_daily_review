@@ -21,6 +21,7 @@ from review_workflow.domain.models import (
     WorkflowState,
 )
 from review_workflow.infrastructure.json_state_store import WorkflowStateStore
+from review_workflow.infrastructure.legacy_gateway import LegacyPortfolioGateway
 from review_workflow.interfaces.http_api import ApiError, ReviewApiServer, config_from_payload
 
 
@@ -98,6 +99,25 @@ def _can_bind_local_port() -> bool:
 
 
 class ReviewWorkflowTest(unittest.TestCase):
+    def test_default_document_stays_in_review_date_directory(self) -> None:
+        config = WorkflowConfig(review_date="2026-09-10")
+
+        local_runtime = LegacyPortfolioGateway().runtime_info(config)
+        model_runtime = LegacyPortfolioGateway().runtime_info(
+            WorkflowConfig(review_date="2026-09-10", provider="gemini")
+        )
+
+        expected = (
+            Path(__file__).resolve().parents[1]
+            / "screenshots"
+            / "2026"
+            / "09"
+            / "10"
+            / "20260910_持股个股复盘.md"
+        )
+        self.assertEqual(local_runtime.output_path, expected)
+        self.assertEqual(model_runtime.output_path, expected)
+
     def test_api_accepts_local_provider(self) -> None:
         config = config_from_payload(
             {

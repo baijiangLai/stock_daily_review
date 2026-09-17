@@ -12,6 +12,7 @@ from review_workflow.infrastructure.legacy_gateway import LegacyPortfolioGateway
 from review_workflow.infrastructure.local_review import (
     DailyBar,
     calculate_indicators,
+    fetch_stock_history,
     LocalStockData,
     parse_sohu_history,
     render_portfolio_summary,
@@ -84,6 +85,27 @@ class LocalReviewTest(unittest.TestCase):
         self.assertIn("个股相对核心板块", report)
         self.assertIn("明显强于核心板块", report)
         self.assertIn("不构成投资建议", report)
+
+    def test_stock_history_falls_back_to_exact_date_snapshot(self) -> None:
+        snapshot = DailyBar(
+            "2026-09-17", 10.2, 10.5, 0.5, 5.0, 10.0, 10.6,
+            300.0, 3200.0, 6.0,
+        )
+        with mock.patch(
+            "review_workflow.infrastructure.local_review._request_json",
+            return_value=_history_payload(),
+        ), mock.patch(
+            "review_workflow.infrastructure.local_review.fetch_stock_snapshot_bar",
+            return_value=snapshot,
+        ):
+            history = fetch_stock_history(
+                {"name": "示例股票", "code": "000157", "quote_id": "0.000157"},
+                "2026-09-17",
+                timeout=5,
+            )
+
+        self.assertEqual(history[-1], snapshot)
+        self.assertIsNotNone(calculate_indicators(history)["ma5"])
 
     def test_portfolio_summary_uses_local_data_sidecars(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

@@ -35,7 +35,6 @@ workflow_state.json
 workflow_state_*.json
 *_持股个股复盘.md
 *当日复盘.md
-每日复盘.md
 
 # Python/runtime artifacts
 __pycache__/
