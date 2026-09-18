@@ -395,6 +395,39 @@ class ReviewLogicTest(unittest.TestCase):
         self.assertEqual(holding.name, "测试|股票")
         self.assertEqual(portfolio.markdown_cell(holding.name), "测试\\|股票")
 
+    def test_parse_portfolio_accepts_daily_operation_lines(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            portfolio_file = Path(directory) / "my_stock.txt"
+            portfolio_file.write_text(
+                "示例股票A,10.00,100,1年\n"
+                "9.80,买入20\n"
+                "示例股票B,20.00,200,6个月\n"
+                "买入21.30,50\n"
+                "示例股票C,30.00,300,3个月\n"
+                "31.50,卖出40\n",
+                encoding="utf-8",
+            )
+            holdings = portfolio.parse_portfolio(portfolio_file)
+
+        self.assertEqual(holdings[0].operation["action"], "买入")
+        self.assertEqual(holdings[0].operation["price"], "9.80")
+        self.assertEqual(holdings[0].operation["quantity"], "20")
+        self.assertEqual(holdings[1].operation["action"], "买入")
+        self.assertEqual(holdings[1].operation["price"], "21.30")
+        self.assertEqual(holdings[2].operation["action"], "卖出")
+        self.assertEqual(holdings[2].operation["quantity"], "40")
+
+    def test_parse_portfolio_rejects_invalid_daily_operation(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            portfolio_file = Path(directory) / "my_stock.txt"
+            portfolio_file.write_text(
+                "示例股票A,10.00,100,1年\n买入100\n",
+                encoding="utf-8",
+            )
+
+            with self.assertRaisesRegex(portfolio.ReviewError, "操作格式无效"):
+                portfolio.parse_portfolio(portfolio_file)
+
     def test_metadata_match_does_not_self_match_query(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             metadata_path = Path(directory) / "metadata.json"

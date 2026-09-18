@@ -142,7 +142,19 @@ class ReviewWorkflowTest(unittest.TestCase):
             review_path.write_text("# 测试个股复盘\n\n包含技术面与仓位计划。", encoding="utf-8")
             document = render_review_document(
                 "2026-09-10",
-                [{"name": "示例股票B", "cost": "20.00", "shares": "200", "plan": "6个月"}],
+                [
+                    {
+                        "name": "示例股票B",
+                        "cost": "20.00",
+                        "shares": "200",
+                        "plan": "6个月",
+                        "operation": {
+                            "action": "买入",
+                            "price": "19.80",
+                            "quantity": "50",
+                        },
+                    }
+                ],
                 [
                     {
                         "holding": {"name": "示例股票B"},
@@ -164,6 +176,7 @@ class ReviewWorkflowTest(unittest.TestCase):
             )
 
             self.assertIn("2026.9.10 持股个股复盘", document)
+            self.assertIn("买入 50股 @ 19.80", document)
             self.assertIn("成功生成个股复盘：1 / 1", document)
             self.assertIn("示例股票A | AI 复盘 | API 429", document)
             self.assertIn("包含技术面与仓位计划", document)

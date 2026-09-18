@@ -65,14 +65,17 @@ class Holding:
     cost: str
     shares: str
     plan: str
+    operation: Optional[Dict[str, str]] = None
 
-    def as_dict(self) -> Dict[str, str]:
-        return {
+    def as_dict(self) -> Dict[str, Any]:
+        value = {
             "name": self.name,
             "cost": self.cost,
             "shares": self.shares,
             "plan": self.plan,
+            "operation": self.operation,
         }
+        return value
 
 
 def parse_args() -> argparse.Namespace:
@@ -202,6 +205,14 @@ def parse_portfolio(path: Path) -> List[Holding]:
         )
 
     holdings: List[Holding] = []
+    pending_holding: Optional[Holding] = None
+
+    def accept_pending() -> None:
+        nonlocal pending_holding
+        if pending_holding is not None:
+            holdings.append(pending_holding)
+            pending_holding = None
+
     for line_number, raw_line in enumerate(
         path.read_text(encoding="utf-8").splitlines(), start=1
     ):
@@ -209,18 +220,101 @@ def parse_portfolio(path: Path) -> List[Holding]:
         if not line or line.startswith("#"):
             continue
         fields = [field.strip() for field in re.split(r"[,，\t]", line)]
-        if len(fields) != 4 or not all(fields):
-            raise ReviewError(
-                f"{path.name} 第 {line_number} 行格式无效：{line}。"
-                "请写成：股票名称,成本,持股数,计划持有时间"
+        if len(fields) == 4 and all(fields):
+            accept_pending()
+            pending_holding = Holding(
+                name=fields[0], cost=fields[1], shares=fields[2], plan=fields[3]
             )
-        holdings.append(
-            Holding(name=fields[0], cost=fields[1], shares=fields[2], plan=fields[3])
+            continue
+
+        if pending_holding is not None:
+            operation = parse_operation_line(line)
+            if operation is None:
+                raise ReviewError(
+                    f"{path.name} 第 {line_number} 行操作格式无效：{line}。"
+                    "股票行后的操作行请写成：成交价,买入数量；"
+                    "例如 34.80,买入100 或 34.80,卖出100"
+                )
+            else:
+                pending_holding = Holding(
+                    name=pending_holding.name,
+                    cost=pending_holding.cost,
+                    shares=pending_holding.shares,
+                    plan=pending_holding.plan,
+                    operation=operation,
+                )
+                accept_pending()
+                continue
+
+        accept_pending()
+        if len(fields) in {2, 3} and any(re.search(r"买入|买|卖出|卖", item) for item in fields):
+            raise ReviewError(
+                f"{path.name} 第 {line_number} 行操作格式无效：{line}。"
+                "请紧跟对应股票行写：成交价,买入数量；例如 34.80,买入100"
+            )
+        if len(fields) == 2 and _looks_like_price_and_quantity(fields):
+            raise ReviewError(
+                f"{path.name} 第 {line_number} 行操作缺少“买入/卖出”：{line}。"
+                "请写成：34.80,买入100 或 34.80,卖出100"
+            )
+        raise ReviewError(
+            f"{path.name} 第 {line_number} 行格式无效：{line}。"
+            "请写成：股票名称,成本,持股数,计划持有时间"
         )
 
+    accept_pending()
     if not holdings:
         raise ReviewError(f"持仓文件为空：{path}")
     return holdings
+
+
+def _looks_like_price_and_quantity(fields: List[str]) -> bool:
+    return bool(
+        len(fields) == 2
+        and re.fullmatch(r"\d+(?:\.\d+)?", fields[0])
+        and re.fullmatch(r"\d+(?:股)?", fields[1])
+    )
+
+
+def parse_operation_line(line: str) -> Optional[Dict[str, str]]:
+    """Parse a daily trade line following its holding row.
+
+    Accepted examples::
+
+        34.80,买入100
+        34.80,买入,100
+        买入34.80,100
+        34.80 买入 100
+        34.80,100  # defaults to buy
+    """
+
+    normalized = re.sub(r"[,，\t]", " ", line)
+    normalized = re.sub(r"\s+", " ", normalized).strip()
+    action_match = re.search(r"(买入|买|卖出|卖)", normalized)
+    if not action_match and not _looks_like_price_and_quantity(normalized.split(" ")):
+        return None
+
+    action = "买入"
+    if action_match:
+        action = "卖出" if action_match.group(1) in {"卖出", "卖"} else "买入"
+        normalized = normalized.replace(action_match.group(1), " ", 1)
+
+    numbers = re.findall(r"\d+(?:\.\d+)?", normalized)
+    if len(numbers) != 2:
+        return None
+    try:
+        price = float(numbers[0])
+        quantity = int(float(numbers[1]))
+    except ValueError:
+        return None
+    if price <= 0 or quantity <= 0:
+        return None
+    return {
+        "action": action,
+        "price": f"{price:.2f}",
+        "quantity": str(quantity),
+        "raw": line,
+    }
 
 
 def find_reusable_stock_dir(

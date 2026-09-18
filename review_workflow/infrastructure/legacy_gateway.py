@@ -18,6 +18,7 @@ from .local_review import (
     generate_local_stock_review,
     generate_portfolio_summary as generate_local_portfolio_summary,
 )
+from .weekly_strategy import review_weekly_strategy
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -30,7 +31,7 @@ class LegacyPortfolioGateway:
     def parse_review_date(self, value: str) -> date:
         return portfolio.parse_review_date(value)
 
-    def load_holdings(self, config: WorkflowConfig) -> List[Dict[str, str]]:
+    def load_holdings(self, config: WorkflowConfig) -> List[Dict[str, Any]]:
         if config.holdings:
             return [dict(holding) for holding in config.holdings]
         return [
@@ -135,7 +136,15 @@ class LegacyPortfolioGateway:
         config: WorkflowConfig,
     ) -> str:
         if config.provider == "local":
-            return generate_local_portfolio_summary(review_date, reviews, config.timeout)
+            weekly_strategy, _, _ = review_weekly_strategy(review_date, reviews)
+            daily_summary = generate_local_portfolio_summary(
+                review_date, reviews, config.timeout
+            )
+            return (
+                weekly_strategy.rstrip()
+                + "\n\n---\n\n"
+                + daily_summary.rstrip()
+            )
 
         legacy_reviews = []
         for item in reviews:

@@ -31,7 +31,7 @@ class WorkflowConfig:
     no_portfolio_summary: bool = False
     board: List[str] = field(default_factory=list)
     peer_stock: List[str] = field(default_factory=list)
-    holdings: List[Dict[str, str]] = field(default_factory=list)
+    holdings: List[Dict[str, Any]] = field(default_factory=list)
 
     @classmethod
     def from_dict(cls, value: Dict[str, Any]) -> "WorkflowConfig":

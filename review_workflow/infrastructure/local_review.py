@@ -10,6 +10,7 @@ unavailable.
 from __future__ import annotations
 
 import json
+import gzip
 import math
 import re
 import time
@@ -32,6 +33,7 @@ EASTMONEY_QUOTE_API = "https://push2delay.eastmoney.com/api/qt/stock/get"
 EASTMONEY_FINANCIAL_API = "https://datacenter-web.eastmoney.com/api/data/v1/get"
 EASTMONEY_ANNOUNCEMENT_API = "https://np-anotice-stock.eastmoney.com/api/security/ann"
 EASTMONEY_SEARCH_API = "https://search-api-web.eastmoney.com/search/jsonp"
+EASTMONEY_F10_API = "https://emweb.securities.eastmoney.com/PC_HSF10"
 
 
 class LocalReviewError(RuntimeError):
@@ -55,7 +57,7 @@ class DailyBar:
 @dataclass
 class LocalStockData:
     stock: Dict[str, Any]
-    holding: Dict[str, str]
+    holding: Dict[str, Any]
     bar: DailyBar
     history: List[DailyBar]
     indicators: Dict[str, Optional[float]]
@@ -64,7 +66,24 @@ class LocalStockData:
     financial: Optional[Dict[str, Any]]
     announcements: List[Dict[str, str]]
     news: List[Dict[str, str]]
+    f10: Optional["F10Data"]
     source_note: str
+
+
+@dataclass
+class F10Data:
+    company: Dict[str, Any]
+    listing: Dict[str, Any]
+    main_business_date: str
+    main_business: List[Dict[str, Any]]
+    regions: List[Dict[str, Any]]
+    business_review: str
+    boards: List[str]
+    concepts: List[Dict[str, str]]
+    holder_stats: Dict[str, Any]
+    actual_controller: Dict[str, Any]
+    top_float_holders: List[Dict[str, Any]]
+    errors: List[str]
 
 
 def _request_json(url: str, timeout: float) -> Any:
@@ -75,6 +94,7 @@ def _request_json(url: str, timeout: float) -> Any:
             headers={
                 "User-Agent": USER_AGENT,
                 "Accept": "application/json, text/plain, */*",
+                "Accept-Encoding": "gzip",
                 "Referer": "https://quote.eastmoney.com/",
             },
         )
@@ -83,6 +103,7 @@ def _request_json(url: str, timeout: float) -> Any:
                 request, timeout=max(timeout, 5.0)
             ) as response:
                 raw = response.read()
+                raw = _decode_response_payload(raw)
                 for encoding in (
                     response.headers.get_content_charset(),
                     "utf-8",
@@ -103,6 +124,12 @@ def _request_json(url: str, timeout: float) -> Any:
             if attempt < 2:
                 time.sleep(0.5 * (attempt + 1))
     raise LocalReviewError(f"公开行情接口请求失败：{url}：{last_error}")
+
+
+def _decode_response_payload(raw: bytes) -> bytes:
+    if raw.startswith(b"\x1f\x8b"):
+        return gzip.decompress(raw)
+    return raw
 
 
 def _number(value: Any, default: Optional[float] = None) -> Optional[float]:
@@ -406,37 +433,208 @@ def fetch_board_quotes(
 
 def fetch_market_indices(review_date: str, timeout: float) -> List[Dict[str, Any]]:
     definitions = (
-        ("上证指数", "1.000001"),
-        ("深证成指", "0.399001"),
-        ("创业板指", "0.399006"),
+        ("上证指数", "zs_000001", "1.000001"),
+        ("深证成指", "zs_399001", "0.399001"),
+        ("创业板指", "zs_399006", "0.399006"),
     )
     result: List[Dict[str, Any]] = []
-    for name, secid in definitions:
+    end = date.fromisoformat(review_date)
+    start = end - timedelta(days=30)
+    for name, index_code, secid in definitions:
         query = urllib.parse.urlencode(
             {
-                "secid": secid,
-                "fields": "f43,f57,f58,f59,f60,f86,f169,f170",
+                "code": index_code,
+                "start": start.strftime("%Y%m%d"),
+                "end": end.strftime("%Y%m%d"),
+                "stat": 1,
+                "order": "D",
+                "period": "d",
             }
         )
         try:
-            payload = _request_json(f"{EASTMONEY_QUOTE_API}?{query}", timeout)
-            data = payload.get("data") if isinstance(payload, dict) else {}
-            if not isinstance(data, dict) or not _snapshot_is_for_date(data, review_date):
-                continue
-            decimals = int(data.get("f59", 2) or 2)
-            index_pct = _scaled(data.get("f170"), 2)
-            result.append(
-                {
-                    "name": name,
-                    "close": _scaled(data.get("f43"), decimals),
-                    "change_pct": (
-                        index_pct / 100 if index_pct is not None else None
-                    ),
-                }
-            )
+            payload = _request_json(f"{SOHU_HISTORY_API}?{query}", timeout)
+            history = parse_sohu_history(payload, review_date)
+            if history[-1].date != review_date:
+                snapshot = fetch_market_index_snapshot(
+                    name, secid, review_date, timeout
+                )
+                if snapshot is None:
+                    continue
+                result.append(snapshot)
+            else:
+                result.append(
+                    {
+                        "name": name,
+                        "close": history[-1].close,
+                        "change_pct": history[-1].change_pct / 100,
+                    }
+                )
         except Exception:
             continue
     return result
+
+
+def fetch_market_index_snapshot(
+    name: str, secid: str, review_date: str, timeout: float
+) -> Optional[Dict[str, Any]]:
+    """Fetch an exact-date index snapshot when Sohu's daily row is delayed."""
+
+    query = urllib.parse.urlencode(
+        {
+            "secid": secid,
+            "fields": "f43,f57,f58,f59,f60,f86,f169,f170",
+        }
+    )
+    payload = _request_json(f"{EASTMONEY_QUOTE_API}?{query}", timeout)
+    data = payload.get("data") if isinstance(payload, dict) else {}
+    if not isinstance(data, dict) or not _snapshot_is_for_date(data, review_date):
+        return None
+    decimals = int(data.get("f59", 2) or 2)
+    close = _scaled(data.get("f43"), decimals)
+    change_pct = _scaled(data.get("f170"), 2)
+    if close is None or change_pct is None:
+        return None
+    return {
+        "name": name,
+        "close": close,
+        "change_pct": change_pct / 100,
+    }
+
+
+def _f10_module(stock: Mapping[str, Any], module: str, timeout: float) -> Dict[str, Any]:
+    code = str(stock.get("code", "")).strip()
+    if not re.fullmatch(r"\d{6}", code):
+        raise LocalReviewError(f"F10 股票代码格式无效：{code}")
+    market = "SH" if code.startswith(("6", "9")) else "SZ"
+    query = urllib.parse.urlencode({"code": f"{market}{code}"})
+    payload = _request_json(
+        f"{EASTMONEY_F10_API}/{module}/PageAjax?{query}", timeout
+    )
+    return payload if isinstance(payload, dict) else {}
+
+
+def _rows_as_of(
+    rows: Sequence[Mapping[str, Any]], date_field: str, review_date: str
+) -> List[Dict[str, Any]]:
+    valid = [
+        dict(row)
+        for row in rows
+        if str(row.get(date_field, ""))[:10] <= review_date
+    ]
+    if not valid:
+        return []
+    latest_date = max(str(row.get(date_field, ""))[:10] for row in valid)
+    return [row for row in valid if str(row.get(date_field, ""))[:10] == latest_date]
+
+
+def _normalized_business_rows(rows: Sequence[Mapping[str, Any]]) -> List[Dict[str, Any]]:
+    return [
+        {
+            "name": str(row.get("ITEM_NAME", "")),
+            "income_yuan": _number(row.get("MAIN_BUSINESS_INCOME")),
+            "income_ratio": _number(row.get("MBI_RATIO")),
+            "gross_margin": _number(row.get("GROSS_RPOFIT_RATIO")),
+        }
+        for row in rows
+    ]
+
+
+def _latest_mapping(records: Sequence[Mapping[str, Any]]) -> Mapping[str, Any]:
+    return dict(records[0]) if records else {}
+
+
+def _mapping_rows(value: Any) -> List[Dict[str, Any]]:
+    if not isinstance(value, list):
+        return []
+    return [dict(row) for row in value if isinstance(row, dict)]
+
+
+def fetch_f10_profile(
+    stock: Mapping[str, Any], review_date: str, timeout: float
+) -> F10Data:
+    """Collect structured Eastmoney F10 facts without blocking a review."""
+
+    errors: List[str] = []
+
+    def safe_module(module: str) -> Dict[str, Any]:
+        try:
+            return _f10_module(stock, module, timeout)
+        except Exception as exc:
+            errors.append(f"{module}: {exc}")
+            return {}
+
+    company_payload = safe_module("CompanySurvey")
+    business_payload = safe_module("BusinessAnalysis")
+    core_payload = safe_module("CoreConception")
+    holder_payload = safe_module("ShareholderResearch")
+
+    company = dict(_latest_mapping(company_payload.get("jbzl", [])))
+    listing = dict(_latest_mapping(company_payload.get("fxxg", [])))
+
+    all_business_rows = _mapping_rows(business_payload.get("zygcfx"))
+    latest_business_rows = _rows_as_of(all_business_rows, "REPORT_DATE", review_date)
+    business_date = (
+        str(latest_business_rows[0].get("REPORT_DATE", ""))[:10]
+        if latest_business_rows
+        else ""
+    )
+    main_rows = _normalized_business_rows(
+        [row for row in latest_business_rows if str(row.get("MAINOP_TYPE")) == "2"]
+    )
+    region_rows = _normalized_business_rows(
+        [row for row in latest_business_rows if str(row.get("MAINOP_TYPE")) == "3"]
+    )
+    reviews = _rows_as_of(
+        _mapping_rows(business_payload.get("jyps")), "REPORT_DATE", review_date
+    )
+    business_review = str(reviews[0].get("BUSINESS_REVIEW", "")) if reviews else ""
+
+    boards = [
+        str(row.get("BOARD_NAME", "")).strip()
+        for row in _mapping_rows(core_payload.get("ssbk"))
+        if str(row.get("BOARD_NAME", "")).strip()
+    ]
+    concepts = [
+        {
+            "keyword": str(row.get("KEYWORD", "")).strip(),
+            "classification": str(row.get("KEY_CLASSIF", "")).strip(),
+        }
+        for row in _mapping_rows(core_payload.get("hxtc"))
+        if str(row.get("KEYWORD", "")).strip()
+    ]
+
+    holder_rows = _rows_as_of(
+        _mapping_rows(holder_payload.get("gdrs")), "END_DATE", review_date
+    )
+    holder_stats = dict(holder_rows[0]) if holder_rows else {}
+    float_holder_rows = _rows_as_of(
+        _mapping_rows(holder_payload.get("sdltgd")), "END_DATE", review_date
+    )
+    top_float_holders = [
+        {
+            "name": str(row.get("HOLDER_NAME", "")),
+            "ratio": _number(row.get("FREE_HOLDNUM_RATIO")),
+            "change": str(row.get("HOLD_NUM_CHANGE", "")),
+        }
+        for row in float_holder_rows[:5]
+    ]
+    actual_controllers = _mapping_rows(holder_payload.get("sjkzr"))
+    actual_controller = dict(actual_controllers[0]) if actual_controllers else {}
+
+    return F10Data(
+        company=company,
+        listing=listing,
+        main_business_date=business_date,
+        main_business=main_rows,
+        regions=region_rows,
+        business_review=business_review,
+        boards=boards,
+        concepts=concepts,
+        holder_stats=holder_stats,
+        actual_controller=actual_controller,
+        top_float_holders=top_float_holders,
+        errors=errors,
+    )
 
 
 def fetch_financial_report(
@@ -507,9 +705,10 @@ def fetch_news(
     stock: Mapping[str, Any], review_date: str, timeout: float, limit: int = 3
 ) -> List[Dict[str, str]]:
     name = str(stock.get("name", ""))
+    code = str(stock.get("code", ""))
     param = {
         "uid": "",
-        "keyword": name,
+        "keyword": f"{name} {code}".strip(),
         "type": ["cmsArticleWebOld"],
         "client": "web",
         "clientType": "web",
@@ -589,9 +788,10 @@ def collect_stock_data(
         financial=fetch_financial_report(stock, review_date, timeout),
         announcements=[] if no_news else fetch_announcements(stock, review_date, timeout),
         news=[] if no_news else fetch_news(stock, review_date, timeout),
+        f10=fetch_f10_profile(stock, review_date, timeout),
         source_note=(
             "行情与均线：搜狐公开日线；估值/板块：东方财富当日公开快照；"
-            "财报/公告/新闻：东方财富公开接口。"
+            "财报/公告/新闻/F10：东方财富公开接口。"
         ),
     )
 
@@ -638,6 +838,419 @@ def _market_state(bar: DailyBar, indicators: Mapping[str, Optional[float]]) -> s
     return "窄幅震荡，方向待选择"
 
 
+def _markdown_text(value: Any) -> str:
+    return str(value if value is not None else "").replace("|", "\\|").replace("\n", " ")
+
+
+def _compact_text(value: Any, limit: int = 420) -> str:
+    text = " ".join(str(value or "").split())
+    if len(text) <= limit:
+        return text
+    return text[: limit - 1].rstrip() + "…"
+
+
+def _render_f10_section(data: LocalStockData) -> List[str]:
+    f10 = data.f10
+    if f10 is None:
+        return ["### F10 公司资料与主营结构", "", "- F10 数据未获取。", ""]
+
+    company = f10.company
+    holder = f10.holder_stats
+    controller_ratio = _number(f10.actual_controller.get("HOLD_RATIO"))
+    controller_ratio_text = (
+        f"{controller_ratio:.2f}%" if controller_ratio is not None else "未披露"
+    )
+    lines = [
+        "### F10 公司资料与主营结构",
+        "",
+        "| 项目 | 内容 |",
+        "| --- | --- |",
+        f"| 公司全称 | {_markdown_text(company.get('ORG_NAME', '待核实'))} |",
+        f"| 东财行业 | {_markdown_text(company.get('EM2016', '待核实'))} |",
+        f"| 上市时间 | {str(company.get('LISTING_DATE') or f10.listing.get('LISTING_DATE') or '')[:10] or '待核实'} |",
+        f"| 董事长 / 总裁 | {_markdown_text(company.get('CHAIRMAN', '待核实'))} / {_markdown_text(company.get('PRESIDENT', '待核实'))} |",
+        f"| 员工人数 | {_fmt(_number(company.get('EMP_NUM')), 0, '人')} |",
+        f"| 实际控制人 | {_markdown_text(f10.actual_controller.get('HOLDER_NAME') or '未披露 / 无实际控制人')}"
+        f"（持股 {controller_ratio_text}） |",
+    ]
+
+    if company.get("ORG_PROFILE"):
+        lines.extend(
+            [
+                "",
+                f"公司简介：{_compact_text(company.get('ORG_PROFILE'), 420)}",
+            ]
+        )
+
+    lines.extend(
+        [
+            "",
+            f"#### 主营构成（F10 披露期：{f10.main_business_date or '待核实'}）",
+            "",
+            "| 业务 | 收入 | 收入占比 | 毛利率 |",
+            "| --- | ---: | ---: | ---: |",
+        ]
+    )
+    if f10.main_business:
+        for row in f10.main_business[:8]:
+            income = row.get("income_yuan")
+            income_text = (
+                f"{income / 100000000:.2f}亿" if income is not None else "待核实"
+            )
+            lines.append(
+                f"| {_markdown_text(row.get('name', ''))} | {income_text} | "
+                f"{_fmt_percent(row.get('income_ratio'))} | "
+                f"{_fmt_percent(row.get('gross_margin'))} |"
+            )
+    else:
+        lines.append("| 待核实 | 待核实 | 待核实 | 待核实 |")
+
+    if f10.regions:
+        lines.extend(
+            [
+                "",
+                "地区收入结构："
+                + "；".join(
+                    f"{_markdown_text(row.get('name', ''))} "
+                    f"{_fmt_percent(row.get('income_ratio'))}"
+                    for row in f10.regions
+                )
+                + "。",
+            ]
+        )
+
+    concept_groups: Dict[str, List[str]] = {}
+    for item in f10.concepts:
+        classification = item.get("classification") or "其他"
+        concept_groups.setdefault(classification, []).append(item.get("keyword", ""))
+    lines.extend(["", "**核心概念/题材：**", ""])
+    if concept_groups:
+        for classification, keywords in concept_groups.items():
+            lines.append(
+                f"- {classification}：{'; '.join(dict.fromkeys(keywords))}"
+            )
+    else:
+        lines.append("- 待核实。")
+
+    if f10.boards:
+        lines.extend(
+            [
+                "",
+                "F10 板块标签："
+                + "、".join(dict.fromkeys(f10.boards[:18]))
+                + "。",
+                "口径说明：公司资料、板块标签与核心概念来自当前 F10 快照；"
+                "主营构成和股东数据已按复盘日截止时间过滤。",
+            ]
+        )
+
+    lines.extend(
+        [
+            "",
+            "#### 股东与筹码（F10）",
+            "",
+            f"- 股东人数：{_fmt(_number(holder.get('HOLDER_TOTAL_NUM')), 0, '户')}；"
+            f"上期变化：{_fmt(_number(holder.get('TOTAL_NUM_RATIO')), 2, '%')}；"
+            f"筹码集中度：{_markdown_text(holder.get('HOLD_FOCUS', '待核实'))}；",
+            f"- 前十大流通股东合计持股：{_fmt(_number(holder.get('FREEHOLD_RATIO_TOTAL')), 2, '%')}；",
+        ]
+    )
+    if f10.top_float_holders:
+        lines.append("- 前五大流通股东：")
+        for row in f10.top_float_holders:
+            lines.append(
+                f"  - {_markdown_text(row.get('name', ''))}："
+                f"{_fmt(row.get('ratio'), 2, '%')}，变动 {row.get('change') or '待核实'}；"
+            )
+
+    if f10.business_review:
+        lines.extend(
+            [
+                "",
+                f"经营回顾摘要：{_compact_text(f10.business_review, 520)}",
+            ]
+        )
+
+    lines.extend(["", "#### F10 与盘面结合判断", ""])
+    main_rows = [row for row in f10.main_business if row.get("income_ratio") is not None]
+    main_rows.sort(key=lambda row: float(row["income_ratio"]), reverse=True)
+    if main_rows:
+        top_business = main_rows[0]
+        high_margin = [
+            row for row in main_rows
+            if (row.get("income_ratio") or 0) >= 0.05
+            and row.get("gross_margin") is not None
+        ]
+        high_margin.sort(key=lambda row: float(row["gross_margin"]), reverse=True)
+        lines.append(
+            f"- 业务结构：收入占比最高的是 **{top_business['name']}**"
+            f"（{_fmt_percent(top_business.get('income_ratio'))}），"
+            "短线题材必须能落到该业务或明确的新增长曲线上，否则持续性需要打折。"
+        )
+        if high_margin:
+            best = high_margin[0]
+            weakest = high_margin[-1]
+            lines.append(
+                f"- 盈利质量：主要业务中毛利率最高为 **{best['name']}** "
+                f"（{_fmt_percent(best.get('gross_margin'))}），最低为 **{weakest['name']}** "
+                f"（{_fmt_percent(weakest.get('gross_margin'))}）；关注高毛利业务是否持续放量。"
+            )
+
+    overseas = next(
+        (
+            row for row in f10.regions
+            if "境外" in str(row.get("name", "")) or "海外" in str(row.get("name", ""))
+        ),
+        None,
+    )
+    if overseas:
+        lines.append(
+            f"- 海外暴露：境外收入占比 **{_fmt_percent(overseas.get('income_ratio'))}**，"
+            "需跟踪汇率、海外需求、贸易与交付风险。"
+        )
+
+    quote_board_names = {
+        str(board.get("name", "")) for board in data.boards if not board.get("error")
+    }
+    overlap = [name for name in f10.boards if name in quote_board_names]
+    if overlap:
+        lines.append(
+            "- 板块印证：F10 标签与当日行情板块重合于 "
+            + "、".join(overlap)
+            + "，说明当前板块映射与公司主营业务口径一致。"
+        )
+
+    holder_change = _number(holder.get("TOTAL_NUM_RATIO"))
+    if holder_change is not None and abs(holder_change) >= 20:
+        direction = "增加" if holder_change > 0 else "减少"
+        chips = "筹码趋于分散" if holder_change > 0 else "筹码趋于集中"
+        if abs(holder_change) >= 100:
+            chips += "，且变化幅度异常，需先核实是否涉及股本变动或统计口径变化"
+        lines.append(
+            f"- 筹码变化：股东人数较上期{direction} **{abs(holder_change):.2f}%**，{chips}；"
+            "需结合换手率和股价位置判断是派发还是吸筹。"
+        )
+
+    if (data.bar.turnover_pct or 0) >= 10:
+        keywords = [
+            item["keyword"] for item in f10.concepts
+            if item.get("classification") in {"主营业务", "行业背景"}
+        ][:5]
+        theme_text = "、".join(keywords) if keywords else "F10 概念标签"
+        lines.append(
+            f"- 交易属性：今日换手率 **{_fmt(data.bar.turnover_pct, 2, '%')}**，"
+            f"叠加题材线索（{theme_text}），短线主题交易属性强，必须严格按价位纪律执行。"
+        )
+
+    if f10.errors:
+        lines.append(
+            "- F10 部分接口未获取成功："
+            + "；".join(f10.errors)
+            + "。"
+        )
+    lines.append("")
+    return lines
+
+
+def _execution_grade(
+    operation: Mapping[str, Any],
+    bar: Mapping[str, Any],
+    average_price: Optional[float],
+) -> str:
+    price = _number(operation.get("price"))
+    high = _number(bar.get("high"))
+    low = _number(bar.get("low"))
+    close = _number(bar.get("close"))
+    if price is None or high is None or low is None or close is None:
+        return "待核实"
+    if price > high or price < low:
+        return "数据异常"
+
+    position = (price - low) / (high - low) if high > low else 0.5
+    is_buy = operation.get("action") == "买入"
+    if average_price is not None:
+        if is_buy and price <= average_price * 0.99:
+            return "优秀：低于当日均价约1%以上"
+        if not is_buy and price >= average_price * 1.01:
+            return "优秀：高于当日均价约1%以上"
+    if is_buy:
+        if position <= 0.35:
+            return "良好：接近当日低位区"
+        if position >= 0.80:
+            return "偏差：明显追高"
+    else:
+        if position >= 0.65:
+            return "良好：接近当日高位区"
+        if position <= 0.20:
+            return "偏差：明显低位卖出"
+    return "合格：接近日内中性价格"
+
+
+def _render_operation_section(data: LocalStockData) -> List[str]:
+    operation = data.holding.get("operation")
+    supports, resistances = _nearest_levels(data.bar, data.indicators)
+    bar = asdict(data.bar)
+    lines = ["### 今日实际操作复盘", ""]
+    if not isinstance(operation, dict):
+        return lines + [
+            f"- 未记录实际操作；后续按周策略执行，支撑 **{supports[0]:.2f} / {supports[1]:.2f}**，"
+            f"压力 **{resistances[0]:.2f} / {resistances[1]:.2f}**。",
+            "",
+        ]
+
+    price = _number(operation.get("price"))
+    quantity = _number(operation.get("quantity"))
+    close = _number(bar.get("close"))
+    volume_shares = (_number(bar.get("volume_hands")) or 0) * 100
+    amount_yuan = (_number(bar.get("amount_wan")) or 0) * 10000
+    average_price = amount_yuan / volume_shares if volume_shares else None
+    action = str(operation.get("action", "待核实"))
+    grade = _execution_grade(operation, bar, average_price)
+    immediate_pnl = (
+        quantity * (close - price)
+        if price is not None and quantity is not None and close is not None
+        else None
+    )
+    if action == "卖出" and immediate_pnl is not None:
+        immediate_pnl = -immediate_pnl
+
+    lines.extend(
+        [
+            f"- 操作：**{action} {quantity or 0:.0f} 股，成交价 {price or 0:.2f} 元**；",
+            f"- 执行评价：**{grade}**；",
+        ]
+    )
+    if average_price is not None:
+        lines.append(f"- 当日估算均价：**{average_price:.2f} 元**（成交额 / 成交量）；")
+    cost = _number(data.holding.get("cost"))
+    if price is not None and cost is not None:
+        if action == "买入":
+            cost_effect = "低于综合成本，有助于摊低持仓成本" if price < cost else "高于综合成本，会抬升持仓成本"
+            lines.append(
+                f"- 成本影响：成交价相对综合成本 **{price - cost:+.2f} 元**，{cost_effect}。"
+            )
+        else:
+            realized = quantity * (price - cost) if quantity is not None else None
+            if realized is not None:
+                lines.append(
+                    f"- 成本对照：相对综合成本，本次卖出估算盈亏 **{realized:+.2f} 元**。"
+                )
+    if quantity is not None and quantity > (_number(data.holding.get("shares")) or 0):
+        lines.append("- 数据警告：操作数量大于当前记录总持股，请核对总持仓和操作行。")
+    if immediate_pnl is not None:
+        direction = "买后浮盈" if immediate_pnl >= 0 else "买后浮亏"
+        if action == "卖出":
+            direction = "卖出后少亏/锁定优势" if immediate_pnl >= 0 else "卖出后股价上行"
+        lines.append(
+            f"- 相对收盘结果：{direction} **{immediate_pnl:+.2f} 元**"
+            f"（按收盘价与成交价差估算）。"
+        )
+
+    low = _number(bar.get("low"))
+    high = _number(bar.get("high"))
+    if price is not None and (price > high or price < low):
+        lines.append(
+            "- 数据校验失败：成交价不在当日最高价与最低价之间，请核对操作记录。"
+        )
+
+    if action == "买入":
+        if price is not None and price >= resistances[0]:
+            lines.append(
+                "- 纪律评价：买入位置接近压力区，短线安全边际不足；后续必须用收盘站稳压力来验证。"
+            )
+        elif price is not None and price <= supports[1]:
+            lines.append(
+                "- 纪律评价：买入位置接近支撑区，价格有安全边际，但需防止弱势股左侧接飞刀。"
+            )
+        else:
+            lines.append("- 纪律评价：买入位置处于支撑与压力之间，属于中性执行区。")
+
+        if close is not None and price is not None and close >= price:
+            lines.extend(
+                [
+                    "",
+                    "### 后续操作",
+                    "",
+                    f"- 当前买后处于正确状态。若收盘跌破 **{supports[0]:.2f}**，先减仓；"
+                    f"若冲高至 **{resistances[0]:.2f}-{resistances[1]:.2f}** 且量能衰减，锁定部分利润。",
+                    "",
+                ]
+            )
+        else:
+            lines.extend(
+                [
+                    "",
+                    "### 后续操作",
+                    "",
+                    f"- 买后暂时被套，不能因为已买入而放宽风控。收盘跌破 **{supports[0]:.2f}** 必须降仓；"
+                    f"只有重新站上 **{resistances[0]:.2f}** 才视为买回正确。",
+                    "",
+                ]
+            )
+    elif action == "卖出":
+        if price is not None and price >= resistances[0]:
+            lines.append(
+                "- 纪律评价：卖出位置接近压力区，属于利用强势降低仓位，执行质量较好。"
+            )
+        elif price is not None and price <= supports[1]:
+            lines.append(
+                "- 纪律评价：卖出位置接近支撑区，属于恐慌性低位卖出，纪律质量偏差。"
+            )
+        else:
+            lines.append("- 纪律评价：卖出位置处于中性区间。")
+
+        if close is not None and price is not None and close <= price:
+            lines.extend(
+                [
+                    "",
+                    "### 后续操作",
+                    "",
+                    f"- 卖出后收盘不高于成交价，卖出目前有效。不要急于买回；"
+                    f"重新站上 **{resistances[0]:.2f}** 后再评估右侧买回。",
+                    "",
+                ]
+            )
+        else:
+            lines.extend(
+                [
+                    "",
+                    "### 后续操作",
+                    "",
+                    f"- 卖出后股价继续上行，说明卖出偏早。禁止追高补回；"
+                    f"等待回踩 **{supports[0]:.2f}-{supports[1]:.2f}** 且止跌后再评估。",
+                    "",
+                ]
+            )
+    else:
+        lines.append("- 操作类型无效，请核对买入/卖出标记。")
+    return lines
+
+
+def _daily_pnl(holding: Mapping[str, Any], bar: DailyBar) -> Optional[float]:
+    shares = _number(holding.get("shares"))
+    if shares is None:
+        return None
+    operation = holding.get("operation")
+    if not isinstance(operation, dict):
+        return bar.change * shares
+
+    quantity = _number(operation.get("quantity"))
+    price = _number(operation.get("price"))
+    if quantity is None or price is None or quantity <= 0:
+        return bar.change * shares
+
+    action = str(operation.get("action", ""))
+    full_position_pnl = bar.change * shares
+    if action == "买入":
+        # 股票行记录的是操作后总持仓；先剔除全日涨跌中重复计入的新仓，
+        # 再按成交价到收盘计算新仓当日盈亏。
+        return full_position_pnl + quantity * (bar.close - price - bar.change)
+    if action == "卖出":
+        # 股票行记录的是卖出后剩余持仓；已卖出部分仍计入当日实际盈亏。
+        return full_position_pnl + quantity * (price - bar.close + bar.change)
+    return full_position_pnl
+
+
 def render_stock_review(data: LocalStockData) -> str:
     bar = data.bar
     holding = data.holding
@@ -649,7 +1262,7 @@ def render_stock_review(data: LocalStockData) -> str:
     cost_value = cost * shares
     pnl = market_value - cost_value
     pnl_pct = pnl / cost_value if cost_value else None
-    daily_pnl = bar.change * shares
+    daily_pnl = _daily_pnl(holding, bar)
     supports, resistances = _nearest_levels(bar, indicators)
     ma_values = [(name, indicators.get(key)) for name, key in (
         ("MA5", "ma5"), ("MA10", "ma10"), ("MA20", "ma20"), ("MA60", "ma60")
@@ -672,6 +1285,7 @@ def render_stock_review(data: LocalStockData) -> str:
         f"- 今日持仓盈亏 **{daily_pnl:+.2f} 元**；",
         f"- 状态判断：**{_market_state(bar, indicators)}**。",
         "",
+        *_render_operation_section(data),
         "### 当日交易数据",
         "",
         "| 项目 | 数值 |",
@@ -744,6 +1358,9 @@ def render_stock_review(data: LocalStockData) -> str:
                 f"差值 **{relative_to_core:+.2f}个百分点**，{strength}。",
             ]
         )
+
+    lines.extend(["", *_render_f10_section(data)])
+
     lines.extend(
         [
             "",
@@ -773,6 +1390,14 @@ def render_stock_review(data: LocalStockData) -> str:
 
     lines.extend(["", "### 公开新闻线索", ""])
     if data.news:
+        stock_name = str(data.stock.get("name", ""))
+        stock_code = str(data.stock.get("code", ""))
+        has_stock_specific_news = any(
+            stock_name in item["title"] or stock_code in item["title"]
+            for item in data.news
+        )
+        if not has_stock_specific_news:
+            lines.append("- 以下为相关板块/行业检索结果，标题未直接指向公司，需人工核实关联性。")
         for item in data.news:
             lines.append(f"- {item['date']}｜{item['media']}｜[{item['title']}]({item['url']})")
     else:
@@ -849,7 +1474,7 @@ def render_portfolio_summary(
                 "shares": shares,
                 "market_value": market_value,
                 "cost_value": cost * shares,
-                "daily_pnl": bar.change * shares,
+                "daily_pnl": _daily_pnl(holding, bar),
                 "indicators": data.get("indicators", {}),
             }
         )

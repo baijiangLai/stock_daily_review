@@ -22,6 +22,17 @@ def _review_content(item: Mapping[str, Any]) -> str:
     return "个股复盘内容缺失。"
 
 
+def _holding_operation(holding: Mapping[str, Any]) -> str:
+    operation = holding.get("operation")
+    if not isinstance(operation, dict):
+        return "未操作"
+    return "{action} {quantity}股 @ {price}".format(
+        action=operation.get("action", "待核实"),
+        quantity=operation.get("quantity", "待核实"),
+        price=operation.get("price", "待核实"),
+    )
+
+
 def render_review_document(
     review_date: str,
     holdings: Sequence[Mapping[str, Any]],
@@ -51,16 +62,17 @@ def render_review_document(
         "",
         "## 持仓总览",
         "",
-        "| 股票 | 成本 | 持股数 | 计划持有时间 |",
-        "| --- | ---: | ---: | --- |",
+        "| 股票 | 成本 | 持股数 | 计划持有时间 | 当日操作 |",
+        "| --- | ---: | ---: | --- | --- |",
     ]
     for holding in holdings:
         lines.append(
-            "| {name} | {cost} | {shares} | {plan} |".format(
+            "| {name} | {cost} | {shares} | {plan} | {operation} |".format(
                 name=markdown_cell(holding.get("name", "")),
                 cost=markdown_cell(holding.get("cost", "")),
                 shares=markdown_cell(holding.get("shares", "")),
                 plan=markdown_cell(holding.get("plan", "")),
+                operation=markdown_cell(_holding_operation(holding)),
             )
         )
 

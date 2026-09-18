@@ -29,7 +29,7 @@ def _now() -> str:
 class StockTask:
     """One holding's position in the review workflow."""
 
-    holding: Dict[str, str]
+    holding: Dict[str, Any]
     status: str = TASK_PENDING
     stage: str = "capture"
     stock_dir: Optional[str] = None
