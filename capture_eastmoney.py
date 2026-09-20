@@ -10,7 +10,7 @@ import shutil
 import sys
 import urllib.parse
 import urllib.request
-from datetime import datetime
+from datetime import date, datetime
 from pathlib import Path
 from typing import Any, Dict, Iterable, Optional
 
@@ -39,7 +39,7 @@ class CaptureError(RuntimeError):
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="输入股票名称或代码，抓取东方财富个股页的四张截图。"
+        description="输入股票名称或代码，抓取东方财富个股页截图；周五/周末追加周 K。"
     )
     parser.add_argument(
         "stock",
@@ -64,6 +64,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--auth-state",
         help=f"登录状态文件，默认 {resolve_auth_state(None)}",
+    )
+    parser.add_argument(
+        "--review-date",
+        default=date.today().isoformat(),
+        help="复盘日期，默认今天；周五/周末会追加周 K 截图",
     )
     return parser.parse_args()
 
@@ -195,6 +200,51 @@ def wait_for_capture_targets(page: Page, timeout: float) -> None:
     first_visible(page, [".quote_title", ".zsquote3l", ".sider_quote_price"])
 
 
+def should_capture_weekly_kline(review_date: Optional[str]) -> bool:
+    if not review_date:
+        return False
+    try:
+        parsed = date.fromisoformat(review_date)
+    except ValueError:
+        return False
+    return parsed.weekday() >= 4  # Friday, Saturday, or Sunday
+
+
+def switch_to_weekly_kline(page: Page, timeout: float) -> None:
+    try:
+        page.wait_for_function(
+            """() => Array.from(document.querySelectorAll('a')).some(link => {
+                const text = (link.innerText || '').trim();
+                return text === '周K';
+            })""",
+            timeout=timeout * 1000,
+        )
+        page.evaluate(
+            """() => {
+                const links = Array.from(document.querySelectorAll('a'));
+                const weekly = links.find(link => (link.innerText || '').trim() === '周K');
+                if (!weekly) return false;
+                for (const type of ['mouseover', 'mousedown', 'mouseup']) {
+                    weekly.dispatchEvent(new MouseEvent(type, {
+                        bubbles: true,
+                        view: window,
+                    }));
+                }
+                weekly.click();
+                return true;
+            }"""
+        )
+        page.wait_for_function(
+            """() => Array.from(document.querySelectorAll('a')).some(link => {
+                const text = (link.innerText || '').trim();
+                return text === '周K' && link.classList.contains('active');
+            })""",
+            timeout=timeout * 1000,
+        )
+    except PlaywrightTimeoutError as exc:
+        raise CaptureError("周 K 线切换超时") from exc
+
+
 def hide_interference(page: Page) -> None:
     interference_selectors = [
         "#em-window-ads",
@@ -314,6 +364,63 @@ def open_stock_page(
     raise CaptureError(f"打开或加载东方财富个股页失败：{last_error}")
 
 
+def ensure_weekly_kline_screenshot(
+    stock_dir: Path,
+    stock: Dict[str, str],
+    args: argparse.Namespace,
+    review_date: Optional[str] = None,
+) -> bool:
+    """Add the weekly K-line snapshot used by Friday/weekend weekly plans."""
+
+    metadata_path = stock_dir / "metadata.json"
+    try:
+        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise CaptureError(f"读取截图元数据失败：{exc}") from exc
+    screenshots = metadata.get("screenshots")
+    if not isinstance(screenshots, dict):
+        screenshots = {}
+        metadata["screenshots"] = screenshots
+
+    filename = str(screenshots.get("weekly_kline") or "04_weekly_kline.png")
+    output_path = stock_dir / filename
+    effective_review_date = review_date or str(metadata.get("review_date") or "")
+    if output_path.is_file() or not should_capture_weekly_kline(effective_review_date):
+        return output_path.is_file()
+
+    timeout_seconds = max(args.timeout, 5.0)
+    with sync_playwright() as playwright:
+        browser = None
+        context = None
+        try:
+            browser = playwright.chromium.launch(
+                channel="chrome",
+                headless=not args.headed,
+            )
+            context, page = open_stock_page(browser, stock, args, timeout_seconds)
+            switch_to_weekly_kline(page, timeout_seconds)
+            page.wait_for_timeout(1000)
+            capture_area(
+                page,
+                [".k_chart", ".kchart_d", "#emchartk"],
+                output_path,
+                timeout_seconds,
+                wait_chart=True,
+            )
+        finally:
+            if context is not None:
+                context.close()
+            if browser is not None:
+                browser.close()
+
+    screenshots["weekly_kline"] = filename
+    metadata_path.write_text(
+        json.dumps(metadata, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    return True
+
+
 def run(args: argparse.Namespace, output_dir: Optional[Path] = None) -> Path:
     timeout_seconds = max(args.timeout, 5.0)
     review_date = getattr(args, "review_date", None)
@@ -349,6 +456,9 @@ def run(args: argparse.Namespace, output_dir: Optional[Path] = None) -> Path:
         "bid_ask_5": "03_bid_ask_5.png",
         "daily_kline": "04_daily_kline.png",
     }
+    weekly_due = should_capture_weekly_kline(review_date)
+    if weekly_due:
+        screenshots["weekly_kline"] = "04_weekly_kline.png"
 
     with sync_playwright() as playwright:
         browser = None
@@ -386,6 +496,16 @@ def run(args: argparse.Namespace, output_dir: Optional[Path] = None) -> Path:
                 timeout_seconds,
                 wait_chart=True,
             )
+            if weekly_due:
+                switch_to_weekly_kline(page, timeout_seconds)
+                page.wait_for_timeout(1000)
+                capture_area(
+                    page,
+                    [".k_chart", ".kchart_d", "#emchartk"],
+                    output_dir / screenshots["weekly_kline"],
+                    timeout_seconds,
+                    wait_chart=True,
+                )
 
             missing = [
                 filename
@@ -426,12 +546,16 @@ def main() -> int:
         print("后续截图会自动复用该登录态；如登录过期，重新执行 --login 即可。")
         return 0
     print(f"已生成 {args.stock} 的东方财富截图：{output_dir}")
+    weekly_due = should_capture_weekly_kline(args.review_date)
     for filename in (
         "01_trading_data.png",
         "02_intraday_chart.png",
         "03_bid_ask_5.png",
         "04_daily_kline.png",
+        "04_weekly_kline.png",
     ):
+        if filename == "04_weekly_kline.png" and not weekly_due:
+            continue
         print(f"  - {output_dir / filename}")
     return 0
 

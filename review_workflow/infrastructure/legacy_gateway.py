@@ -71,6 +71,13 @@ class LegacyPortfolioGateway:
                 holding_value,
                 self.parse_review_date(config.review_date),
             )
+            if not config.skip_capture:
+                portfolio.ensure_weekly_kline_screenshot(
+                    stock_dir,
+                    resolved_stock,
+                    args,
+                    config.review_date,
+                )
         portfolio.capture_or_reuse_boards(stock_dir, resolved_stock, args)
         return CaptureResult(stock_dir=stock_dir, resolved_stock=resolved_stock)
 
@@ -94,6 +101,7 @@ class LegacyPortfolioGateway:
                     stock_dir / "02_intraday_chart.png",
                     stock_dir / "03_bid_ask_5.png",
                     stock_dir / "04_daily_kline.png",
+                    stock_dir / "04_weekly_kline.png",
                 )
             )
             boards = json.loads(
@@ -134,8 +142,9 @@ class LegacyPortfolioGateway:
         review_date: str,
         reviews: Sequence[Mapping[str, Any]],
         config: WorkflowConfig,
-    ) -> str:
+        ) -> str:
         if config.provider == "local":
+            self._ensure_weekly_charts(review_date, reviews, config)
             weekly_strategy, _, _ = review_weekly_strategy(review_date, reviews)
             daily_summary = generate_local_portfolio_summary(
                 review_date, reviews, config.timeout
@@ -210,6 +219,38 @@ class LegacyPortfolioGateway:
             date_root=date_root,
             output_path=output_path,
         )
+
+    def _ensure_weekly_charts(
+        self,
+        review_date: str,
+        reviews: Sequence[Mapping[str, Any]],
+        config: WorkflowConfig,
+    ) -> None:
+        should_capture_weekly = (
+            not config.skip_capture
+            and portfolio.should_capture_weekly_kline(review_date)
+        )
+        if not should_capture_weekly:
+            return
+        args = self._legacy_args(config)
+        for item in reviews:
+            review_path = Path(str(item.get("review_path", "")))
+            stock = dict(item.get("stock") or {})
+            if not stock:
+                try:
+                    stock = json.loads(
+                        (review_path.parent / "metadata.json").read_text(
+                            encoding="utf-8"
+                        )
+                    )["resolved_stock"]
+                except (OSError, ValueError, KeyError):
+                    stock = {}
+            try:
+                portfolio.ensure_weekly_kline_screenshot(
+                    review_path.parent, stock, args, review_date
+                )
+            except Exception as exc:
+                print(f"周 K 截图补充失败：{stock.get('name', '')}：{exc}")
 
     def _date_root(self, review_date: str) -> Path:
         parsed = self.parse_review_date(review_date)

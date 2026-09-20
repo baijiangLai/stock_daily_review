@@ -2,7 +2,7 @@ import json
 import gzip
 import tempfile
 import unittest
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from datetime import datetime
 from zoneinfo import ZoneInfo
 from pathlib import Path
@@ -16,6 +16,8 @@ from review_workflow.infrastructure.local_review import (
     calculate_indicators,
     fetch_market_indices,
     fetch_f10_profile,
+    fetch_margin_trading_balance,
+    MarginBalance,
     fetch_stock_history,
     LocalStockData,
     _decode_response_payload,
@@ -143,50 +145,13 @@ class LocalReviewTest(unittest.TestCase):
             announcements=[],
             news=[],
             f10=F10Data(
-                company={
-                    "ORG_NAME": "示例股份有限公司",
-                    "EM2016": "信息技术-通信设备",
-                    "CHAIRMAN": "张三",
-                    "PRESIDENT": "李四",
-                    "EMP_NUM": 12000,
-                    "ORG_PROFILE": "示例公司专注通信设备与数据中心冷却业务。",
-                },
-                listing={"LISTING_DATE": "2010-01-01 00:00:00"},
-                main_business_date="2026-06-30",
-                main_business=[
-                    {
-                        "name": "通信设备",
-                        "income_yuan": 1_000_000_000.0,
-                        "income_ratio": 0.65,
-                        "gross_margin": 0.28,
-                    },
-                    {
-                        "name": "数据中心冷却",
-                        "income_yuan": 300_000_000.0,
-                        "income_ratio": 0.30,
-                        "gross_margin": 0.12,
-                    },
-                ],
-                regions=[
-                    {"name": "境内销售", "income_ratio": 0.75},
-                    {"name": "境外销售", "income_ratio": 0.25},
-                ],
-                business_review="公司通信设备收入保持增长。",
-                boards=["通信", "通信设备"],
-                concepts=[
-                    {"keyword": "通信设备", "classification": "主营业务"},
-                    {"keyword": "AI 算力", "classification": "行业背景"},
-                ],
-                holder_stats={
-                    "HOLDER_TOTAL_NUM": 100000,
-                    "TOTAL_NUM_RATIO": 25.0,
-                    "HOLD_FOCUS": "非常分散",
-                    "FREEHOLD_RATIO_TOTAL": 30.0,
-                },
-                actual_controller={"HOLDER_NAME": "示例控股", "HOLD_RATIO": 25.0},
-                top_float_holders=[
-                    {"name": "示例控股", "ratio": 20.0, "change": "不变"}
-                ],
+                holder_date="2026-06-30",
+                holder_count=100000,
+                margin=MarginBalance(
+                    date="2026-09-16",
+                    balance_yuan=5_510_933_214.03,
+                    available=True,
+                ),
                 errors=[],
             ),
             source_note="测试来源。",
@@ -199,15 +164,43 @@ class LocalReviewTest(unittest.TestCase):
         self.assertIn("100.00亿", report)
         self.assertIn("个股相对核心板块", report)
         self.assertIn("明显强于核心板块", report)
-        self.assertIn("F10 公司资料与主营结构", report)
+        self.assertIn("F10 关键数据", report)
         self.assertIn("今日实际操作复盘", report)
         self.assertIn("买入 20 股，成交价 10.00 元", report)
         self.assertIn("执行评价", report)
         self.assertIn("后续操作", report)
-        self.assertIn("通信设备", report)
-        self.assertIn("海外暴露", report)
-        self.assertIn("筹码趋于分散", report)
+        self.assertIn("100000户", report)
+        self.assertIn("55.11亿", report)
+        self.assertIn(
+            "| 指标 | 数值 | 数据日期 |\n"
+            "| --- | ---: | --- |\n"
+            "| 最新股东人数 | 100000户 | 2026-06-30 |\n"
+            "| 融资融券余额 | 55.11亿 | 2026-09-16 |",
+            report,
+        )
+        self.assertNotIn("主营构成", report)
+        self.assertNotIn("核心概念", report)
+        self.assertNotIn("实际控制人", report)
+        self.assertNotIn("前五大流通股东", report)
+        self.assertNotIn("股东与筹码", report)
+        self.assertNotIn("F10 与盘面结合判断", report)
+        self.assertNotIn("公司简介", report)
         self.assertIn("不构成投资建议", report)
+
+        no_margin_report = render_stock_review(
+            replace(
+                data,
+                f10=replace(
+                    data.f10,
+                    margin=MarginBalance(
+                        date="", balance_yuan=None, available=False
+                    ),
+                    errors=[],
+                ),
+            )
+        )
+        self.assertIn("| 融资融券余额 | 无数据 | — |", no_margin_report)
+        self.assertNotIn("F10 部分接口未获取成功", no_margin_report)
 
     def test_stock_history_falls_back_to_exact_date_snapshot(self) -> None:
         snapshot = DailyBar(
@@ -229,6 +222,65 @@ class LocalReviewTest(unittest.TestCase):
 
         self.assertEqual(history[-1], snapshot)
         self.assertIsNotNone(calculate_indicators(history)["ma5"])
+
+    def test_stock_history_accepts_latest_friday_for_weekend_review(self) -> None:
+        weekend_payload = [
+            {
+                "status": 0,
+                "code": "cn_000157",
+                "hq": [[
+                    "2026-09-18", "10.00", "10.50", "0.50", "5.00%",
+                    "9.90", "10.60", "200.00", "2200.00", "5.00", "",
+                ]],
+            }
+        ]
+        with mock.patch(
+            "review_workflow.infrastructure.local_review._request_json",
+            return_value=weekend_payload,
+        ), mock.patch(
+            "review_workflow.infrastructure.local_review.fetch_stock_snapshot_bar"
+        ) as snapshot:
+            history = fetch_stock_history(
+                {"name": "示例股票", "code": "000157"},
+                "2026-09-20",
+                timeout=5,
+            )
+
+        self.assertEqual(history[-1].date, "2026-09-18")
+        snapshot.assert_not_called()
+
+    def test_weekend_history_supplements_lagging_friday_snapshot(self) -> None:
+        lagging_payload = [
+            {
+                "status": 0,
+                "code": "cn_000157",
+                "hq": [[
+                    "2026-09-17", "10.00", "10.00", "0.00", "0.00%",
+                    "9.90", "10.10", "100.00", "1000.00", "2.00", "",
+                ]],
+            }
+        ]
+        friday_snapshot = DailyBar(
+            "2026-09-18", 10.1, 10.5, 0.5, 5.0, 10.0, 10.6,
+            200.0, 2200.0, 5.0,
+        )
+        with mock.patch(
+            "review_workflow.infrastructure.local_review._request_json",
+            return_value=lagging_payload,
+        ), mock.patch(
+            "review_workflow.infrastructure.local_review.fetch_stock_snapshot_bar",
+            return_value=friday_snapshot,
+        ) as snapshot:
+            history = fetch_stock_history(
+                {"name": "示例股票", "code": "000157"},
+                "2026-09-20",
+                timeout=5,
+            )
+
+        self.assertEqual(history[-1], friday_snapshot)
+        snapshot.assert_called_once_with(
+            {"name": "示例股票", "code": "000157"}, "2026-09-18", 5
+        )
 
     def test_render_operation_section_supports_sell(self) -> None:
         history = parse_sohu_history(_history_payload(), "2026-09-16")
@@ -263,79 +315,106 @@ class LocalReviewTest(unittest.TestCase):
 
     def test_fetch_f10_profile_filters_future_report_dates(self) -> None:
         def module(stock, name: str, timeout: float):
-            if name == "CompanySurvey":
-                return {
-                    "jbzl": [{
-                        "ORG_NAME": "示例股份有限公司",
-                        "EM2016": "信息技术-通信设备",
-                        "CHAIRMAN": "张三",
-                        "PRESIDENT": "李四",
-                        "EMP_NUM": 12000,
-                        "ORG_PROFILE": "示例公司。",
-                    }],
-                    "fxxg": [{"LISTING_DATE": "2010-01-01 00:00:00"}],
-                }
-            if name == "BusinessAnalysis":
-                return {
-                    "zygcfx": [
-                        {
-                            "REPORT_DATE": "2026-06-30 00:00:00",
-                            "MAINOP_TYPE": "2",
-                            "ITEM_NAME": "通信设备",
-                            "MAIN_BUSINESS_INCOME": 1000000000.0,
-                            "MBI_RATIO": 0.65,
-                            "GROSS_RPOFIT_RATIO": 0.28,
-                        },
-                        {
-                            "REPORT_DATE": "2026-09-30 00:00:00",
-                            "MAINOP_TYPE": "2",
-                            "ITEM_NAME": "未来报告期业务",
-                            "MAIN_BUSINESS_INCOME": 2000000000.0,
-                            "MBI_RATIO": 0.80,
-                            "GROSS_RPOFIT_RATIO": 0.40,
-                        },
-                    ],
-                    "jyps": [{
-                        "REPORT_DATE": "2026-06-30 00:00:00",
-                        "BUSINESS_REVIEW": "通信设备收入增长。",
-                    }],
-                }
-            if name == "CoreConception":
-                return {
-                    "ssbk": [{"BOARD_NAME": "通信设备"}],
-                    "hxtc": [
-                        {"KEYWORD": "通信设备", "KEY_CLASSIF": "主营业务"}
-                    ],
-                }
             return {
                 "gdrs": [{
                     "END_DATE": "2026-06-30 00:00:00",
                     "HOLDER_TOTAL_NUM": 100000,
-                    "TOTAL_NUM_RATIO": 25.0,
-                    "HOLD_FOCUS": "非常分散",
-                    "FREEHOLD_RATIO_TOTAL": 30.0,
+                }, {
+                    "END_DATE": "2026-09-30 00:00:00",
+                    "HOLDER_TOTAL_NUM": 120000,
                 }],
-                "sdltgd": [{
-                    "END_DATE": "2026-06-30 00:00:00",
-                    "HOLDER_NAME": "示例控股",
-                    "FREE_HOLDNUM_RATIO": 20.0,
-                    "HOLD_NUM_CHANGE": "不变",
-                }],
-                "sjkzr": [{"HOLDER_NAME": "示例控股", "HOLD_RATIO": 25.0}],
             }
 
         with mock.patch(
             "review_workflow.infrastructure.local_review._f10_module",
             side_effect=module,
+        ) as holder_module, mock.patch(
+            "review_workflow.infrastructure.local_review.fetch_margin_trading_balance",
+            return_value=MarginBalance(
+                date="2026-09-17",
+                balance_yuan=5593903000.43,
+                available=True,
+            ),
         ):
             profile = fetch_f10_profile(
                 {"code": "600522"}, "2026-09-17", timeout=5
             )
 
-        self.assertEqual(profile.main_business_date, "2026-06-30")
-        self.assertEqual(profile.main_business[0]["name"], "通信设备")
-        self.assertEqual(profile.boards, ["通信设备"])
-        self.assertEqual(profile.actual_controller["HOLDER_NAME"], "示例控股")
+        self.assertEqual(profile.holder_date, "2026-06-30")
+        self.assertEqual(profile.holder_count, 100000)
+        self.assertEqual(profile.margin.date, "2026-09-17")
+        self.assertAlmostEqual(profile.margin.balance_yuan, 5593903000.43)
+        self.assertEqual(
+            [call.args[1] for call in holder_module.call_args_list],
+            ["ShareholderResearch"],
+        )
+
+    def test_fetch_margin_trading_balance_requests_latest_row(self) -> None:
+        payload = {
+            "result": {
+                "data": [
+                    {"DATE": "2026-09-17 00:00:00", "RZRQYE": 5593903000.43}
+                ]
+            }
+        }
+        with mock.patch(
+            "review_workflow.infrastructure.local_review._request_json",
+            return_value=payload,
+        ) as request:
+            balance = fetch_margin_trading_balance(
+                {"code": "600522"}, "2026-09-18", timeout=5
+            )
+
+        self.assertEqual(
+            balance,
+            MarginBalance(
+                date="2026-09-17",
+                balance_yuan=5593903000.43,
+                available=True,
+            ),
+        )
+        requested_url = request.call_args[0][0]
+        self.assertIn("RPTA_WEB_RZRQ_GGMX", requested_url)
+        self.assertIn("SCODE%3D%22600522%22", requested_url)
+        self.assertIn("DATE%3C%3D%272026-09-18+00%3A00%3A00%27", requested_url)
+
+    def test_fetch_margin_trading_balance_handles_no_data(self) -> None:
+        payloads = (
+            {"result": None, "success": False, "message": "返回数据为空", "code": 9201},
+            {"result": {"data": []}, "success": True, "code": 0},
+            {"result": {"data": None}, "success": True, "code": 0},
+        )
+        for payload in payloads:
+            with self.subTest(payload=payload), mock.patch(
+                "review_workflow.infrastructure.local_review._request_json",
+                return_value=payload,
+            ):
+                balance = fetch_margin_trading_balance(
+                    {"code": "001308"}, "2026-09-18", timeout=5
+                )
+
+            self.assertEqual(
+                balance,
+                MarginBalance(date="", balance_yuan=None, available=False),
+            )
+
+    def test_fetch_margin_trading_balance_rejects_invalid_payload(self) -> None:
+        payloads = (
+            {"result": None, "success": False, "message": "服务异常", "code": 500},
+            {"result": {"data": "invalid"}, "success": True, "code": 0},
+            {"result": {"data": [{"DATE": "2026-09-17", "RZRQYE": "-"}]}},
+            {"result": {"data": [{"DATE": "", "RZRQYE": 1000.0}]}},
+            {"result": {"data": [{"DATE": "2026-09-19", "RZRQYE": 1000.0}]}},
+        )
+        for payload in payloads:
+            with self.subTest(payload=payload), mock.patch(
+                "review_workflow.infrastructure.local_review._request_json",
+                return_value=payload,
+            ):
+                with self.assertRaisesRegex(Exception, "格式异常|晚于复盘日"):
+                    fetch_margin_trading_balance(
+                        {"code": "001308"}, "2026-09-18", timeout=5
+                    )
 
     def test_portfolio_summary_uses_local_data_sidecars(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

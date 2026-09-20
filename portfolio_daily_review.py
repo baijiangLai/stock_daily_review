@@ -14,7 +14,9 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from capture_eastmoney import (
     CaptureError,
+    ensure_weekly_kline_screenshot,
     resolve_stock,
+    should_capture_weekly_kline,
     run as capture_stock_screenshots,
     slugify,
 )

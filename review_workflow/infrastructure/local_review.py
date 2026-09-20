@@ -71,18 +71,17 @@ class LocalStockData:
 
 
 @dataclass
+class MarginBalance:
+    date: str
+    balance_yuan: Optional[float]
+    available: bool
+
+
+@dataclass
 class F10Data:
-    company: Dict[str, Any]
-    listing: Dict[str, Any]
-    main_business_date: str
-    main_business: List[Dict[str, Any]]
-    regions: List[Dict[str, Any]]
-    business_review: str
-    boards: List[str]
-    concepts: List[Dict[str, str]]
-    holder_stats: Dict[str, Any]
-    actual_controller: Dict[str, Any]
-    top_float_holders: List[Dict[str, Any]]
+    holder_date: str
+    holder_count: Optional[int]
+    margin: Optional[MarginBalance]
     errors: List[str]
 
 
@@ -208,6 +207,13 @@ def parse_sohu_history(payload: Any, review_date: str) -> List[DailyBar]:
     return parsed
 
 
+def _prior_friday(review_date: str) -> date:
+    parsed = date.fromisoformat(review_date)
+    if parsed.weekday() < 5:
+        return parsed
+    return parsed - timedelta(days=parsed.weekday() - 4)
+
+
 def fetch_stock_history(stock: Mapping[str, Any], review_date: str, timeout: float) -> List[DailyBar]:
     code = str(stock.get("code", "")).strip()
     if not re.fullmatch(r"\d{6}", code):
@@ -227,6 +233,15 @@ def fetch_stock_history(stock: Mapping[str, Any], review_date: str, timeout: flo
     payload = _request_json(f"{SOHU_HISTORY_API}?{query}", timeout)
     history = parse_sohu_history(payload, review_date)
     if history[-1].date != review_date:
+        if date.fromisoformat(review_date).weekday() >= 5:
+            latest_trading_date = _prior_friday(review_date)
+            if history[-1].date != latest_trading_date.isoformat():
+                snapshot = fetch_stock_snapshot_bar(
+                    stock, latest_trading_date.isoformat(), timeout
+                )
+                if snapshot is not None:
+                    history.append(snapshot)
+            return history
         snapshot = fetch_stock_snapshot_bar(stock, review_date, timeout)
         if snapshot is None:
             raise LocalReviewError(
@@ -328,14 +343,27 @@ def _scaled(value: Any, exponent: int) -> Optional[float]:
     return number / (10**exponent) if number is not None else None
 
 
-def _snapshot_is_for_date(data: Mapping[str, Any], review_date: str) -> bool:
+def _snapshot_is_for_date(
+    data: Mapping[str, Any],
+    review_date: str,
+    *,
+    allow_weekend_prior: bool = False,
+) -> bool:
     timestamp = _number(data.get("f86"))
     if timestamp is None:
         return False
     snapshot_date = datetime.fromtimestamp(
         timestamp, tz=SHANGHAI_TIMEZONE
     ).date().isoformat()
-    return snapshot_date == review_date
+    if snapshot_date == review_date:
+        return True
+    if not allow_weekend_prior:
+        return False
+    parsed_review_date = date.fromisoformat(review_date)
+    if parsed_review_date.weekday() < 5:
+        return False
+    prior_friday = _prior_friday(review_date)
+    return snapshot_date == prior_friday.isoformat()
 
 
 def fetch_valuation(
@@ -357,7 +385,7 @@ def fetch_valuation(
             "close", "market_cap", "float_market_cap", "pe", "pb",
             "turnover_pct", "change", "change_pct", "volume_ratio",
         )}
-    if not _snapshot_is_for_date(data, review_date):
+    if not _snapshot_is_for_date(data, review_date, allow_weekend_prior=True):
         return {
             key: None
             for key in (
@@ -399,7 +427,9 @@ def fetch_board_quotes(
             data = payload.get("data") if isinstance(payload, dict) else {}
             if not isinstance(data, dict):
                 raise LocalReviewError(f"板块 {code} 返回格式异常")
-            if not _snapshot_is_for_date(data, review_date):
+            if not _snapshot_is_for_date(
+                data, review_date, allow_weekend_prior=True
+            ):
                 raise LocalReviewError(
                     f"板块实时快照日期与复盘日 {review_date} 不一致"
                 )
@@ -455,6 +485,24 @@ def fetch_market_indices(review_date: str, timeout: float) -> List[Dict[str, Any
             payload = _request_json(f"{SOHU_HISTORY_API}?{query}", timeout)
             history = parse_sohu_history(payload, review_date)
             if history[-1].date != review_date:
+                if date.fromisoformat(review_date).weekday() >= 5:
+                    latest_trading_date = _prior_friday(review_date)
+                    index_bar = {
+                        "name": name,
+                        "close": history[-1].close,
+                        "change_pct": history[-1].change_pct / 100,
+                    }
+                    if history[-1].date != latest_trading_date.isoformat():
+                        snapshot = fetch_market_index_snapshot(
+                            name,
+                            secid,
+                            latest_trading_date.isoformat(),
+                            timeout,
+                        )
+                        if snapshot is not None:
+                            index_bar = snapshot
+                    result.append(index_bar)
+                    continue
                 snapshot = fetch_market_index_snapshot(
                     name, secid, review_date, timeout
                 )
@@ -487,7 +535,9 @@ def fetch_market_index_snapshot(
     )
     payload = _request_json(f"{EASTMONEY_QUOTE_API}?{query}", timeout)
     data = payload.get("data") if isinstance(payload, dict) else {}
-    if not isinstance(data, dict) or not _snapshot_is_for_date(data, review_date):
+    if not isinstance(data, dict) or not _snapshot_is_for_date(
+        data, review_date, allow_weekend_prior=True
+    ):
         return None
     decimals = int(data.get("f59", 2) or 2)
     close = _scaled(data.get("f43"), decimals)
@@ -527,22 +577,6 @@ def _rows_as_of(
     return [row for row in valid if str(row.get(date_field, ""))[:10] == latest_date]
 
 
-def _normalized_business_rows(rows: Sequence[Mapping[str, Any]]) -> List[Dict[str, Any]]:
-    return [
-        {
-            "name": str(row.get("ITEM_NAME", "")),
-            "income_yuan": _number(row.get("MAIN_BUSINESS_INCOME")),
-            "income_ratio": _number(row.get("MBI_RATIO")),
-            "gross_margin": _number(row.get("GROSS_RPOFIT_RATIO")),
-        }
-        for row in rows
-    ]
-
-
-def _latest_mapping(records: Sequence[Mapping[str, Any]]) -> Mapping[str, Any]:
-    return dict(records[0]) if records else {}
-
-
 def _mapping_rows(value: Any) -> List[Dict[str, Any]]:
     if not isinstance(value, list):
         return []
@@ -552,88 +586,102 @@ def _mapping_rows(value: Any) -> List[Dict[str, Any]]:
 def fetch_f10_profile(
     stock: Mapping[str, Any], review_date: str, timeout: float
 ) -> F10Data:
-    """Collect structured Eastmoney F10 facts without blocking a review."""
+    """Collect the two F10 facts used by reviews: holders and margin balance."""
 
     errors: List[str] = []
 
-    def safe_module(module: str) -> Dict[str, Any]:
+    def safe_holder_module() -> Dict[str, Any]:
         try:
-            return _f10_module(stock, module, timeout)
+            return _f10_module(stock, "ShareholderResearch", timeout)
         except Exception as exc:
-            errors.append(f"{module}: {exc}")
+            errors.append(f"ShareholderResearch: {exc}")
             return {}
 
-    company_payload = safe_module("CompanySurvey")
-    business_payload = safe_module("BusinessAnalysis")
-    core_payload = safe_module("CoreConception")
-    holder_payload = safe_module("ShareholderResearch")
-
-    company = dict(_latest_mapping(company_payload.get("jbzl", [])))
-    listing = dict(_latest_mapping(company_payload.get("fxxg", [])))
-
-    all_business_rows = _mapping_rows(business_payload.get("zygcfx"))
-    latest_business_rows = _rows_as_of(all_business_rows, "REPORT_DATE", review_date)
-    business_date = (
-        str(latest_business_rows[0].get("REPORT_DATE", ""))[:10]
-        if latest_business_rows
-        else ""
-    )
-    main_rows = _normalized_business_rows(
-        [row for row in latest_business_rows if str(row.get("MAINOP_TYPE")) == "2"]
-    )
-    region_rows = _normalized_business_rows(
-        [row for row in latest_business_rows if str(row.get("MAINOP_TYPE")) == "3"]
-    )
-    reviews = _rows_as_of(
-        _mapping_rows(business_payload.get("jyps")), "REPORT_DATE", review_date
-    )
-    business_review = str(reviews[0].get("BUSINESS_REVIEW", "")) if reviews else ""
-
-    boards = [
-        str(row.get("BOARD_NAME", "")).strip()
-        for row in _mapping_rows(core_payload.get("ssbk"))
-        if str(row.get("BOARD_NAME", "")).strip()
-    ]
-    concepts = [
-        {
-            "keyword": str(row.get("KEYWORD", "")).strip(),
-            "classification": str(row.get("KEY_CLASSIF", "")).strip(),
-        }
-        for row in _mapping_rows(core_payload.get("hxtc"))
-        if str(row.get("KEYWORD", "")).strip()
-    ]
-
+    holder_payload = safe_holder_module()
     holder_rows = _rows_as_of(
         _mapping_rows(holder_payload.get("gdrs")), "END_DATE", review_date
     )
-    holder_stats = dict(holder_rows[0]) if holder_rows else {}
-    float_holder_rows = _rows_as_of(
-        _mapping_rows(holder_payload.get("sdltgd")), "END_DATE", review_date
-    )
-    top_float_holders = [
-        {
-            "name": str(row.get("HOLDER_NAME", "")),
-            "ratio": _number(row.get("FREE_HOLDNUM_RATIO")),
-            "change": str(row.get("HOLD_NUM_CHANGE", "")),
-        }
-        for row in float_holder_rows[:5]
-    ]
-    actual_controllers = _mapping_rows(holder_payload.get("sjkzr"))
-    actual_controller = dict(actual_controllers[0]) if actual_controllers else {}
+    holder = holder_rows[0] if holder_rows else {}
+    holder_count = _number(holder.get("HOLDER_TOTAL_NUM"))
+
+    try:
+        margin = fetch_margin_trading_balance(stock, review_date, timeout)
+    except Exception as exc:
+        errors.append(f"MarginTrading: {exc}")
+        margin = None
 
     return F10Data(
-        company=company,
-        listing=listing,
-        main_business_date=business_date,
-        main_business=main_rows,
-        regions=region_rows,
-        business_review=business_review,
-        boards=boards,
-        concepts=concepts,
-        holder_stats=holder_stats,
-        actual_controller=actual_controller,
-        top_float_holders=top_float_holders,
+        holder_date=str(holder.get("END_DATE", ""))[:10],
+        holder_count=int(holder_count) if holder_count is not None else None,
+        margin=margin,
         errors=errors,
+    )
+
+
+def fetch_margin_trading_balance(
+    stock: Mapping[str, Any], review_date: str, timeout: float
+) -> MarginBalance:
+    """Fetch the latest margin-trading balance on or before ``review_date``."""
+
+    code = str(stock.get("code", "")).strip()
+    if not re.fullmatch(r"\d{6}", code):
+        raise LocalReviewError(f"融资融券股票代码格式无效：{code}")
+    query = urllib.parse.urlencode(
+        {
+            "reportName": "RPTA_WEB_RZRQ_GGMX",
+            "columns": "DATE,RZRQYE",
+            "filter": f'(SCODE="{code}")(DATE<=\'{review_date} 00:00:00\')',
+            "pageNumber": 1,
+            "pageSize": 1,
+            "sortColumns": "DATE",
+            "sortTypes": -1,
+        }
+    )
+    payload = _request_json(f"{EASTMONEY_FINANCIAL_API}?{query}", timeout)
+    if not isinstance(payload, dict):
+        raise LocalReviewError(f"融资融券接口返回格式异常：{code}")
+
+    result = payload.get("result") if isinstance(payload, dict) else None
+    no_data = payload.get("code") == 9201 or payload.get("message") == "返回数据为空"
+    if not isinstance(result, dict):
+        if no_data:
+            return MarginBalance(date="", balance_yuan=None, available=False)
+        raise LocalReviewError(f"融资融券接口返回格式异常：{code}")
+
+    rows = result.get("data")
+    if rows is None:
+        if no_data or payload.get("success", True) is not False:
+            return MarginBalance(date="", balance_yuan=None, available=False)
+        raise LocalReviewError(f"融资融券接口返回格式异常：{code}")
+
+    if not isinstance(rows, list):
+        raise LocalReviewError(f"融资融券接口返回格式异常：{code}")
+
+    if not rows:
+        return MarginBalance(date="", balance_yuan=None, available=False)
+
+    row = (
+        rows[0]
+        if isinstance(rows, list) and rows and isinstance(rows[0], dict)
+        else None
+    )
+    if row is None:
+        raise LocalReviewError(f"融资融券余额未返回 {code} 数据")
+    balance = _number(row.get("RZRQYE"))
+    if balance is None:
+        raise LocalReviewError(f"融资融券余额格式异常：{code}")
+    margin_date = str(row.get("DATE", ""))[:10]
+    try:
+        parsed_margin_date = date.fromisoformat(margin_date)
+        parsed_review_date = date.fromisoformat(review_date)
+    except ValueError as exc:
+        raise LocalReviewError(f"融资融券日期格式异常：{code}") from exc
+    if parsed_margin_date > parsed_review_date:
+        raise LocalReviewError(f"融资融券日期晚于复盘日：{code}")
+    return MarginBalance(
+        date=margin_date,
+        balance_yuan=balance,
+        available=True,
     )
 
 
@@ -838,216 +886,29 @@ def _market_state(bar: DailyBar, indicators: Mapping[str, Optional[float]]) -> s
     return "窄幅震荡，方向待选择"
 
 
-def _markdown_text(value: Any) -> str:
-    return str(value if value is not None else "").replace("|", "\\|").replace("\n", " ")
-
-
-def _compact_text(value: Any, limit: int = 420) -> str:
-    text = " ".join(str(value or "").split())
-    if len(text) <= limit:
-        return text
-    return text[: limit - 1].rstrip() + "…"
-
-
 def _render_f10_section(data: LocalStockData) -> List[str]:
     f10 = data.f10
     if f10 is None:
-        return ["### F10 公司资料与主营结构", "", "- F10 数据未获取。", ""]
+        return ["### F10 关键数据", "", "- F10 数据未获取。", ""]
 
-    company = f10.company
-    holder = f10.holder_stats
-    controller_ratio = _number(f10.actual_controller.get("HOLD_RATIO"))
-    controller_ratio_text = (
-        f"{controller_ratio:.2f}%" if controller_ratio is not None else "未披露"
-    )
+    if f10.margin is None:
+        margin_value, margin_date = "待核实", "待核实"
+    elif f10.margin.available:
+        margin_value = _fmt_yuan(f10.margin.balance_yuan)
+        margin_date = f10.margin.date or "待核实"
+    else:
+        margin_value, margin_date = "无数据", "—"
+
     lines = [
-        "### F10 公司资料与主营结构",
+        "### F10 关键数据",
         "",
-        "| 项目 | 内容 |",
-        "| --- | --- |",
-        f"| 公司全称 | {_markdown_text(company.get('ORG_NAME', '待核实'))} |",
-        f"| 东财行业 | {_markdown_text(company.get('EM2016', '待核实'))} |",
-        f"| 上市时间 | {str(company.get('LISTING_DATE') or f10.listing.get('LISTING_DATE') or '')[:10] or '待核实'} |",
-        f"| 董事长 / 总裁 | {_markdown_text(company.get('CHAIRMAN', '待核实'))} / {_markdown_text(company.get('PRESIDENT', '待核实'))} |",
-        f"| 员工人数 | {_fmt(_number(company.get('EMP_NUM')), 0, '人')} |",
-        f"| 实际控制人 | {_markdown_text(f10.actual_controller.get('HOLDER_NAME') or '未披露 / 无实际控制人')}"
-        f"（持股 {controller_ratio_text}） |",
+        "| 指标 | 数值 | 数据日期 |",
+        "| --- | ---: | --- |",
+        f"| 最新股东人数 | {_fmt(f10.holder_count, 0, '户')} | {f10.holder_date or '待核实'} |",
+        f"| 融资融券余额 | {margin_value} | {margin_date} |",
     ]
-
-    if company.get("ORG_PROFILE"):
-        lines.extend(
-            [
-                "",
-                f"公司简介：{_compact_text(company.get('ORG_PROFILE'), 420)}",
-            ]
-        )
-
-    lines.extend(
-        [
-            "",
-            f"#### 主营构成（F10 披露期：{f10.main_business_date or '待核实'}）",
-            "",
-            "| 业务 | 收入 | 收入占比 | 毛利率 |",
-            "| --- | ---: | ---: | ---: |",
-        ]
-    )
-    if f10.main_business:
-        for row in f10.main_business[:8]:
-            income = row.get("income_yuan")
-            income_text = (
-                f"{income / 100000000:.2f}亿" if income is not None else "待核实"
-            )
-            lines.append(
-                f"| {_markdown_text(row.get('name', ''))} | {income_text} | "
-                f"{_fmt_percent(row.get('income_ratio'))} | "
-                f"{_fmt_percent(row.get('gross_margin'))} |"
-            )
-    else:
-        lines.append("| 待核实 | 待核实 | 待核实 | 待核实 |")
-
-    if f10.regions:
-        lines.extend(
-            [
-                "",
-                "地区收入结构："
-                + "；".join(
-                    f"{_markdown_text(row.get('name', ''))} "
-                    f"{_fmt_percent(row.get('income_ratio'))}"
-                    for row in f10.regions
-                )
-                + "。",
-            ]
-        )
-
-    concept_groups: Dict[str, List[str]] = {}
-    for item in f10.concepts:
-        classification = item.get("classification") or "其他"
-        concept_groups.setdefault(classification, []).append(item.get("keyword", ""))
-    lines.extend(["", "**核心概念/题材：**", ""])
-    if concept_groups:
-        for classification, keywords in concept_groups.items():
-            lines.append(
-                f"- {classification}：{'; '.join(dict.fromkeys(keywords))}"
-            )
-    else:
-        lines.append("- 待核实。")
-
-    if f10.boards:
-        lines.extend(
-            [
-                "",
-                "F10 板块标签："
-                + "、".join(dict.fromkeys(f10.boards[:18]))
-                + "。",
-                "口径说明：公司资料、板块标签与核心概念来自当前 F10 快照；"
-                "主营构成和股东数据已按复盘日截止时间过滤。",
-            ]
-        )
-
-    lines.extend(
-        [
-            "",
-            "#### 股东与筹码（F10）",
-            "",
-            f"- 股东人数：{_fmt(_number(holder.get('HOLDER_TOTAL_NUM')), 0, '户')}；"
-            f"上期变化：{_fmt(_number(holder.get('TOTAL_NUM_RATIO')), 2, '%')}；"
-            f"筹码集中度：{_markdown_text(holder.get('HOLD_FOCUS', '待核实'))}；",
-            f"- 前十大流通股东合计持股：{_fmt(_number(holder.get('FREEHOLD_RATIO_TOTAL')), 2, '%')}；",
-        ]
-    )
-    if f10.top_float_holders:
-        lines.append("- 前五大流通股东：")
-        for row in f10.top_float_holders:
-            lines.append(
-                f"  - {_markdown_text(row.get('name', ''))}："
-                f"{_fmt(row.get('ratio'), 2, '%')}，变动 {row.get('change') or '待核实'}；"
-            )
-
-    if f10.business_review:
-        lines.extend(
-            [
-                "",
-                f"经营回顾摘要：{_compact_text(f10.business_review, 520)}",
-            ]
-        )
-
-    lines.extend(["", "#### F10 与盘面结合判断", ""])
-    main_rows = [row for row in f10.main_business if row.get("income_ratio") is not None]
-    main_rows.sort(key=lambda row: float(row["income_ratio"]), reverse=True)
-    if main_rows:
-        top_business = main_rows[0]
-        high_margin = [
-            row for row in main_rows
-            if (row.get("income_ratio") or 0) >= 0.05
-            and row.get("gross_margin") is not None
-        ]
-        high_margin.sort(key=lambda row: float(row["gross_margin"]), reverse=True)
-        lines.append(
-            f"- 业务结构：收入占比最高的是 **{top_business['name']}**"
-            f"（{_fmt_percent(top_business.get('income_ratio'))}），"
-            "短线题材必须能落到该业务或明确的新增长曲线上，否则持续性需要打折。"
-        )
-        if high_margin:
-            best = high_margin[0]
-            weakest = high_margin[-1]
-            lines.append(
-                f"- 盈利质量：主要业务中毛利率最高为 **{best['name']}** "
-                f"（{_fmt_percent(best.get('gross_margin'))}），最低为 **{weakest['name']}** "
-                f"（{_fmt_percent(weakest.get('gross_margin'))}）；关注高毛利业务是否持续放量。"
-            )
-
-    overseas = next(
-        (
-            row for row in f10.regions
-            if "境外" in str(row.get("name", "")) or "海外" in str(row.get("name", ""))
-        ),
-        None,
-    )
-    if overseas:
-        lines.append(
-            f"- 海外暴露：境外收入占比 **{_fmt_percent(overseas.get('income_ratio'))}**，"
-            "需跟踪汇率、海外需求、贸易与交付风险。"
-        )
-
-    quote_board_names = {
-        str(board.get("name", "")) for board in data.boards if not board.get("error")
-    }
-    overlap = [name for name in f10.boards if name in quote_board_names]
-    if overlap:
-        lines.append(
-            "- 板块印证：F10 标签与当日行情板块重合于 "
-            + "、".join(overlap)
-            + "，说明当前板块映射与公司主营业务口径一致。"
-        )
-
-    holder_change = _number(holder.get("TOTAL_NUM_RATIO"))
-    if holder_change is not None and abs(holder_change) >= 20:
-        direction = "增加" if holder_change > 0 else "减少"
-        chips = "筹码趋于分散" if holder_change > 0 else "筹码趋于集中"
-        if abs(holder_change) >= 100:
-            chips += "，且变化幅度异常，需先核实是否涉及股本变动或统计口径变化"
-        lines.append(
-            f"- 筹码变化：股东人数较上期{direction} **{abs(holder_change):.2f}%**，{chips}；"
-            "需结合换手率和股价位置判断是派发还是吸筹。"
-        )
-
-    if (data.bar.turnover_pct or 0) >= 10:
-        keywords = [
-            item["keyword"] for item in f10.concepts
-            if item.get("classification") in {"主营业务", "行业背景"}
-        ][:5]
-        theme_text = "、".join(keywords) if keywords else "F10 概念标签"
-        lines.append(
-            f"- 交易属性：今日换手率 **{_fmt(data.bar.turnover_pct, 2, '%')}**，"
-            f"叠加题材线索（{theme_text}），短线主题交易属性强，必须严格按价位纪律执行。"
-        )
-
     if f10.errors:
-        lines.append(
-            "- F10 部分接口未获取成功："
-            + "；".join(f10.errors)
-            + "。"
-        )
+        lines.extend(["", "- F10 部分接口未获取成功：" + "；".join(f10.errors) + "。"])
     lines.append("")
     return lines
 
