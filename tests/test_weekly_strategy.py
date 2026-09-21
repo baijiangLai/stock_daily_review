@@ -69,8 +69,22 @@ def _write_sidecar(
 def _history(bar_date: str, rich: bool) -> list:
     if not rich:
         return [
-            {"date": bar_date, "close": 10.5, "low": 9.8, "high": 10.8},
-            {"date": "2026-09-11", "close": 10.0, "low": 9.5, "high": 10.2},
+            {
+                "date": bar_date,
+                "open": 10.0,
+                "close": 10.5,
+                "low": 9.8,
+                "high": 10.8,
+                "volume_hands": 100.0,
+            },
+            {
+                "date": "2026-09-11",
+                "open": 10.0,
+                "close": 10.0,
+                "low": 9.5,
+                "high": 10.2,
+                "volume_hands": 80.0,
+            },
         ]
 
     parsed = date.fromisoformat(bar_date)
@@ -292,6 +306,17 @@ class WeeklyStrategyTest(unittest.TestCase):
             self.assertFalse(strategy["first_trading_day"])
 
             item = strategy["items"][0]
+            self.assertIn("daily_pattern", item)
+            self.assertIn("daily_trend", item)
+            self.assertIn("weekly_pattern", item)
+            self.assertIn("weekly_trend", item)
+            self.assertEqual(item["daily_pattern"]["name"], "放量阳线")
+            self.assertEqual(item["daily_trend"]["name"], "强上升趋势")
+            self.assertIn("5日均量", item["daily_pattern"]["definition"])
+            self.assertIn("RSI6", item["daily_trend"]["definition"])
+            self.assertIn("当周", item["weekly_pattern"]["definition"])
+            self.assertIn("5周均量", item["weekly_pattern"]["definition"])
+            self.assertIn("周线RSI12", item["weekly_trend"]["definition"])
             self.assertTrue(item["left_side_buy"]["enabled"])
             self.assertGreater(item["right_side_buy"]["trigger_price"], 10.5)
             self.assertLess(item["stop_loss"]["price"], 10.5)
@@ -300,6 +325,9 @@ class WeeklyStrategyTest(unittest.TestCase):
             self.assertIn("charts/示例股票_000001_daily_kline.png", document)
             self.assertIn("charts/示例股票_000001_weekly_kline.png", document)
             self.assertIn("日线/周线截图", document)
+            self.assertIn("形态与趋势定义", document)
+            self.assertIn("日线形态", document)
+            self.assertIn("周线趋势", document)
             self.assertIn("左右侧买入信号与止损", document)
             self.assertIn("RSI6 ≤ 40", document)
             self.assertIn("100.00 手 / 80.00 手", document)
@@ -324,7 +352,7 @@ class WeeklyStrategyTest(unittest.TestCase):
                     "2026-09-14", [{"review_path": str(review_path)}]
                 )
                 strategy = json.loads(json_path.read_text(encoding="utf-8"))
-                strategy.pop("signal_schema")
+                strategy["signal_schema"] = 2
                 for item in strategy["items"]:
                     for key in (
                         "left_side_buy",
@@ -332,6 +360,10 @@ class WeeklyStrategyTest(unittest.TestCase):
                         "stop_loss",
                         "daily_signals",
                         "weekly_signals",
+                        "daily_pattern",
+                        "daily_trend",
+                        "weekly_pattern",
+                        "weekly_trend",
                     ):
                         item.pop(key, None)
                 json_path.write_text(
@@ -344,10 +376,18 @@ class WeeklyStrategyTest(unittest.TestCase):
 
             upgraded = json.loads(json_path.read_text(encoding="utf-8"))
             self.assertEqual(upgraded["version"], 2)
-            self.assertEqual(upgraded["signal_schema"], 2)
+            self.assertEqual(upgraded["signal_schema"], 3)
             self.assertIn("left_side_buy", upgraded["items"][0])
             self.assertIn("right_side_buy", upgraded["items"][0])
             self.assertIn("stop_loss", upgraded["items"][0])
+            for key in (
+                "daily_pattern",
+                "daily_trend",
+                "weekly_pattern",
+                "weekly_trend",
+            ):
+                self.assertIn(key, upgraded["items"][0])
+                self.assertIn("定义", upgraded["items"][0][key]["definition"])
             self.assertIn("策略格式升级", document)
 
     def test_weekend_uses_latest_trading_data_for_next_week(self) -> None:

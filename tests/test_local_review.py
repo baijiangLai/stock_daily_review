@@ -159,6 +159,11 @@ class LocalReviewTest(unittest.TestCase):
         report = render_stock_review(data)
 
         self.assertIn("示例股票 000157", report)
+        self.assertIn("当前形态：", report)
+        self.assertIn("趋势定义：", report)
+        self.assertIn("定义：", report)
+        self.assertIn("当前形态：**放量阳线**", report)
+        self.assertIn("趋势定义：**趋势待核实**", report)
         self.assertIn("今日持仓盈亏 **+100.00 元**", report)
         self.assertIn("显著放量上涨", report)
         self.assertIn("100.00亿", report)

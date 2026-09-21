@@ -10,6 +10,8 @@ from datetime import date, timedelta
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
+from .market_structure import classify_pattern, classify_trend
+
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 WEEKLY_ROOT = PROJECT_ROOT / "screenshots" / "weekly"
@@ -330,12 +332,69 @@ def _buy_plans(
     }
 
 
+def _latest_daily_bars(payload: Mapping[str, Any]) -> List[Mapping[str, Any]]:
+    history = payload.get("history", [])
+    if not isinstance(history, list):
+        return []
+    bars = [bar for bar in history if isinstance(bar, dict)]
+    bars.sort(key=lambda bar: str(bar.get("date", "")))
+    return bars[-2:]
+
+
+def _pattern_and_trend(
+    payload: Mapping[str, Any],
+    weekly_indicators: Mapping[str, Any],
+) -> Dict[str, Dict[str, str]]:
+    bar = payload.get("bar", {})
+    indicators = payload.get("indicators", {})
+    daily_history = _latest_daily_bars(payload)
+    current_daily = bar if isinstance(bar, dict) else daily_history[-1]
+    previous_daily = daily_history[-2] if len(daily_history) > 1 else None
+
+    weekly_history = _weekly_history(payload)
+    current_weekly = weekly_history[-1] if weekly_history else {}
+    previous_weekly = weekly_history[-2] if len(weekly_history) > 1 else None
+    current_weekly = {**current_weekly, **weekly_indicators}
+    weekly_volumes = [float(item["volume_hands"]) for item in weekly_history]
+    weekly_volume_ma5 = _moving_average(weekly_volumes, 5)
+
+    return {
+        "daily_pattern": classify_pattern(
+            current_daily,
+            previous_daily,
+            _number(indicators.get("volume_ma5")),
+        ),
+        "daily_trend": classify_trend(
+            _number(current_daily.get("close")),
+            _number(indicators.get("ma5")),
+            _number(indicators.get("ma10")),
+            _number(indicators.get("ma20")),
+            _number(indicators.get("rsi6")),
+        ),
+        "weekly_pattern": classify_pattern(
+            current_weekly,
+            previous_weekly,
+            weekly_volume_ma5,
+            timeframe="周线",
+        ),
+        "weekly_trend": classify_trend(
+            _number(current_weekly.get("close")),
+            _number(current_weekly.get("ma5")),
+            _number(current_weekly.get("ma10")),
+            _number(current_weekly.get("ma20")),
+            _number(current_weekly.get("rsi12")),
+            rsi_name="周线RSI12",
+        ),
+    }
+
+
 def _strategy_item(payload: Mapping[str, Any], total_market_value: float) -> Dict[str, Any]:
     stock = payload.get("stock", {})
     holding = payload.get("holding", {})
     bar = payload.get("bar", {})
     indicators = payload.get("indicators", {})
     weekly_indicators = _weekly_indicators(payload)
+    pattern_and_trend = _pattern_and_trend(payload, weekly_indicators)
     close = _number(bar.get("close")) or 0.0
     cost = _number(holding.get("cost")) or 0.0
     shares = int(_number(holding.get("shares")) or 0)
@@ -416,6 +475,7 @@ def _strategy_item(payload: Mapping[str, Any], total_market_value: float) -> Dic
             "volume_ma5": _number(indicators.get("volume_ma5")),
         },
         "weekly_signals": weekly_indicators,
+        **pattern_and_trend,
         **buy_plans,
         "stop_loss": stop_loss,
     }
@@ -456,7 +516,7 @@ def _new_strategy(review_date: str, payloads: Sequence[Mapping[str, Any]]) -> Di
 
     return {
         "version": 1,
-        "signal_schema": 2,
+        "signal_schema": 3,
         "week": None,
         "created_on": review_date,
         "target_week_start": target_week.isoformat(),
@@ -539,7 +599,7 @@ def _upgrade_signal_schema(
     review_date: str,
     payloads: Sequence[Mapping[str, Any]],
 ) -> Dict[str, Any]:
-    if strategy.get("signal_schema") == 2:
+    if strategy.get("signal_schema") == 3:
         return strategy
     if strategy.get("baseline_holdings", {}) != _current_holdings(payloads):
         return strategy
@@ -559,7 +619,7 @@ def _upgrade_signal_schema(
             "date": review_date,
             "from_version": strategy.get("version", 1),
             "to_version": upgraded["version"],
-            "reason": "策略格式升级：补充日线/周线信号、左右侧买入与止损线。",
+            "reason": "策略格式升级 v3：补充日线/周线形态与趋势定义，并同步左右侧买入与止损线。",
         }
     ]
     upgraded["daily_reviews"] = strategy.get("daily_reviews", [])
@@ -779,6 +839,37 @@ def _render(strategy: Mapping[str, Any]) -> str:
             f"{_format(item.get('pressure_1'))} | {_format(item.get('pressure_2'))} | "
             f"减仓 {item.get('reduce_quantity', 0)} 股；{buy_text}；"
             f"止损 {_format(_number(stop_loss.get('price')) if isinstance(stop_loss, dict) else None)} |"
+        )
+
+    lines.extend(
+        [
+            "",
+            "## 形态与趋势定义",
+            "",
+            "| 股票 | 日线形态 | 日线趋势 | 周线形态 | 周线趋势 |",
+            "| --- | --- | --- | --- | --- |",
+        ]
+    )
+    for item in strategy.get("items", []):
+        fields = (
+            ("daily_pattern", "形态待核实"),
+            ("daily_trend", "趋势待核实"),
+            ("weekly_pattern", "形态待核实"),
+            ("weekly_trend", "趋势待核实"),
+        )
+        values = []
+        for key, fallback_name in fields:
+            definition = item.get(key, {})
+            if not isinstance(definition, dict):
+                definition = {}
+            values.append(
+                f"{definition.get('name', fallback_name)}："
+                f"{definition.get('definition', '定义待核实')}"
+            )
+        lines.append(
+            f"| {_markdown(item.get('name', ''))} | {_markdown(values[0])} | "
+            f"{_markdown(values[1])} | {_markdown(values[2])} | "
+            f"{_markdown(values[3])} |"
         )
 
     lines.extend(["", "## 日线/周线截图", ""])

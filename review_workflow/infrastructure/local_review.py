@@ -22,6 +22,8 @@ from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 from zoneinfo import ZoneInfo
 
+from .market_structure import classify_pattern, classify_trend
+
 
 USER_AGENT = (
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
@@ -1133,6 +1135,18 @@ def render_stock_review(data: LocalStockData) -> str:
         value is not None and bar.close >= value
         for value in (indicators.get("ma5"), indicators.get("ma10"), indicators.get("ma20"))
     )
+    current_pattern = classify_pattern(
+        asdict(data.history[-1]),
+        asdict(data.history[-2]) if len(data.history) > 1 else None,
+        indicators.get("volume_ma5"),
+    )
+    current_trend = classify_trend(
+        bar.close,
+        indicators.get("ma5"),
+        indicators.get("ma10"),
+        indicators.get("ma20"),
+        indicators.get("rsi6"),
+    )
 
     lines: List[str] = [
         f"## {data.stock.get('name', '')} {data.stock.get('code', '')}",
@@ -1174,6 +1188,8 @@ def render_stock_review(data: LocalStockData) -> str:
             f"| 5日均量 | {_fmt_hands(indicators.get('volume_ma5'))} | 今日量能 / 5日均量 = {_fmt(_volume_ratio(bar, indicators), 2, '倍')} |",
             f"| RSI6/12/24 | {_fmt(indicators.get('rsi6'))} / {_fmt(indicators.get('rsi12'))} / {_fmt(indicators.get('rsi24'))} | 短线强弱参考 |",
             "",
+            f"当前形态：**{current_pattern['name']}**。{current_pattern['definition']}",
+            f"趋势定义：**{current_trend['name']}**。{current_trend['definition']}",
             f"技术结论：{'收盘低于主要均线，趋势仍偏弱。' if below_all else '收盘站上短期主要均线，短线结构修复。' if above_short else '均线位置分化，趋势尚未一致。'}",
             "",
             "### 板块表现",
