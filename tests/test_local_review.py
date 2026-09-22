@@ -12,7 +12,9 @@ from review_workflow.domain.config import WorkflowConfig
 from review_workflow.infrastructure.legacy_gateway import LegacyPortfolioGateway
 from review_workflow.infrastructure.local_review import (
     DailyBar,
+    EASTMONEY_QUOTE_HOSTS,
     F10Data,
+    LocalReviewError,
     calculate_indicators,
     fetch_market_indices,
     fetch_f10_profile,
@@ -21,6 +23,8 @@ from review_workflow.infrastructure.local_review import (
     fetch_stock_history,
     LocalStockData,
     _decode_response_payload,
+    _request_quote_json,
+    fetch_board_quotes,
     parse_sohu_history,
     render_portfolio_summary,
     render_stock_review,
@@ -58,6 +62,81 @@ class LocalReviewTest(unittest.TestCase):
             _decode_response_payload(b'{"ok":true}'),
             b'{"ok":true}',
         )
+
+    TENCENT_SAMPLE = (
+        'v_sh600522="1~中天科技~600522~36.95~35.98~36.10~2367453~1260742~1106711~'
+        '36.95~7972~36.94~14915~36.93~1433~36.92~1006~36.91~2793~'
+        '36.96~4361~36.97~1592~36.98~3647~36.99~4440~37.00~11951~'
+        '~20260921161443~0.97~2.70~37.25~36.10~36.95/2367453/8703515000~'
+        '2367453~870352~6.94~33.88~~37.25~36.10~3.20~1261.08~1261.08~";\n'
+    )
+
+    def test_parse_tencent_quote_fields(self) -> None:
+        from review_workflow.infrastructure.local_review import parse_tencent_quote
+
+        fields = parse_tencent_quote(self.TENCENT_SAMPLE, "sh600522")
+        self.assertIsNotNone(fields)
+        self.assertEqual(fields[2], "600522")
+        self.assertEqual(fields[3], "36.95")
+        self.assertEqual(fields[30], "20260921161443")
+        self.assertIsNone(parse_tencent_quote('v_sz000000="1~x"', "sh600522"))
+
+    def test_fetch_tencent_snapshot_bar_builds_daily_bar(self) -> None:
+        from review_workflow.infrastructure.local_review import (
+            fetch_tencent_snapshot_bar,
+        )
+
+        stock = {"name": "中天科技", "code": "600522"}
+        with mock.patch(
+            "review_workflow.infrastructure.local_review._request_text",
+            return_value=self.TENCENT_SAMPLE,
+        ):
+            bar = fetch_tencent_snapshot_bar(stock, "2026-09-21", 5.0)
+
+        self.assertIsNotNone(bar)
+        self.assertEqual(bar.date, "2026-09-21")
+        self.assertEqual(bar.close, 36.95)
+        self.assertEqual(bar.open, 36.10)
+        self.assertEqual(bar.high, 37.25)
+        self.assertEqual(bar.low, 36.10)
+        self.assertEqual(bar.volume_hands, 2367453)
+        self.assertEqual(bar.amount_wan, 870352)
+        self.assertEqual(bar.turnover_pct, 6.94)
+
+    def test_fetch_tencent_snapshot_bar_rejects_stale_date(self) -> None:
+        from review_workflow.infrastructure.local_review import (
+            fetch_tencent_snapshot_bar,
+        )
+
+        stock = {"name": "中天科技", "code": "600522"}
+        with mock.patch(
+            "review_workflow.infrastructure.local_review._request_text",
+            return_value=self.TENCENT_SAMPLE,
+        ):
+            # 快照时间 2026-09-21 与复盘日 2026-09-18 不匹配，应返回 None
+            self.assertIsNone(
+                fetch_tencent_snapshot_bar(stock, "2026-09-18", 5.0)
+            )
+
+    def test_fetch_stock_snapshot_bar_falls_back_to_tencent(self) -> None:
+        from review_workflow.infrastructure.local_review import (
+            fetch_stock_snapshot_bar,
+        )
+
+        stock = {"name": "中天科技", "code": "600522", "quote_id": "1.600522"}
+        with mock.patch(
+            "review_workflow.infrastructure.local_review._request_quote_json",
+            side_effect=LocalReviewError("push2 集群限流"),
+        ), mock.patch(
+            "review_workflow.infrastructure.local_review._request_text",
+            return_value=self.TENCENT_SAMPLE,
+        ) as request_text:
+            bar = fetch_stock_snapshot_bar(stock, "2026-09-21", 5.0)
+
+        self.assertIsNotNone(bar)
+        self.assertEqual(bar.close, 36.95)
+        request_text.assert_called_once()
+        self.assertIn("sh600522", request_text.call_args[0][0])
 
     def test_fetch_market_indices_uses_exact_history_date(self) -> None:
         payload = [
@@ -206,6 +285,104 @@ class LocalReviewTest(unittest.TestCase):
         )
         self.assertIn("| 融资融券余额 | 无数据 | — |", no_margin_report)
         self.assertNotIn("F10 部分接口未获取成功", no_margin_report)
+
+    def test_quote_host_rotation_recovers_from_empty_reply(self) -> None:
+        """裸行情域名返回空响应时，自动切换到编号分片主机。"""
+
+        calls: list = []
+
+        def fake_request(url: str, timeout: float, attempts: int = 3):
+            calls.append(url)
+            if url.startswith(EASTMONEY_QUOTE_HOSTS[0]):
+                raise LocalReviewError("公开行情接口请求失败：空响应")
+            return {"data": {"f43": 620}}
+
+        with mock.patch(
+            "review_workflow.infrastructure.local_review._request_json",
+            side_effect=fake_request,
+        ):
+            payload = _request_quote_json("secid=0.000157&fields=f43", 10.0)
+
+        self.assertEqual(payload["data"]["f43"], 620)
+        self.assertEqual(len(calls), 2)
+        self.assertTrue(calls[0].startswith(EASTMONEY_QUOTE_HOSTS[0]))
+        self.assertTrue(calls[1].startswith(EASTMONEY_QUOTE_HOSTS[1]))
+
+    def test_quote_request_raises_when_all_hosts_fail(self) -> None:
+        """所有行情主机都失败时，保留最后一次错误。"""
+
+        with mock.patch(
+            "review_workflow.infrastructure.local_review._request_json",
+            side_effect=LocalReviewError("公开行情接口请求失败：空响应"),
+        ):
+            with self.assertRaises(LocalReviewError):
+                _request_quote_json("secid=0.000157&fields=f43", 10.0)
+
+    def test_quote_host_rotation_includes_http_fallback(self) -> None:
+        """HTTPS 全部被限流时，轮换到 HTTP 80 端口的行情主机。"""
+
+        calls: list = []
+
+        def fake_request(url: str, timeout: float, attempts: int = 3):
+            calls.append(url)
+            if url.startswith("https://"):
+                raise LocalReviewError("Remote end closed connection without response")
+            return {"data": {"f43": 475864}}
+
+        with mock.patch(
+            "review_workflow.infrastructure.local_review._request_json",
+            side_effect=fake_request,
+        ):
+            payload = _request_quote_json("secid=90.BK1205&fields=f43", 10.0)
+
+        self.assertEqual(payload["data"]["f43"], 475864)
+        https_calls = [url for url in calls if url.startswith("https://")]
+        http_calls = [url for url in calls if url.startswith("http://")]
+        self.assertTrue(https_calls)
+        self.assertTrue(http_calls)
+        self.assertEqual(len(set(http_calls)), len(http_calls))
+
+    def test_board_quotes_fall_back_to_http_hosts(self) -> None:
+        """板块行情在 HTTPS 主机全部失败时仍能取到数据。"""
+
+        board_metadata = {
+            "boards": {
+                "一级行业": {"code": "BK1205", "name": "机械设备"},
+            }
+        }
+
+        def fake_request(url: str, timeout: float, attempts: int = 3):
+            if url.startswith("https://"):
+                raise LocalReviewError("Remote end closed connection without response")
+            return {
+                "data": {
+                    "f43": 475864,
+                    "f47": 65177720,
+                    "f48": 159805731693.0,
+                    "f50": 0.86,
+                    "f57": "BK1205",
+                    "f58": "机械设备",
+                    "f59": 2,
+                    "f60": 468779,
+                    "f86": 1789990770,
+                    "f168": 1.51,
+                    "f169": 70.85,
+                    "f170": 1.51,
+                }
+            }
+
+        with mock.patch(
+            "review_workflow.infrastructure.local_review._request_json",
+            side_effect=fake_request,
+        ), mock.patch(
+            "review_workflow.infrastructure.local_review._request_text",
+            side_effect=AssertionError("腾讯兜底不应被触发"),
+        ):
+            boards = fetch_board_quotes(board_metadata, "2026-09-21", 10.0)
+
+        self.assertEqual(len(boards), 1)
+        self.assertIsNone(boards[0].get("error"))
+        self.assertAlmostEqual(boards[0]["change_pct"], 0.0151, places=6)
 
     def test_stock_history_falls_back_to_exact_date_snapshot(self) -> None:
         snapshot = DailyBar(

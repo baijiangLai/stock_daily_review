@@ -3,13 +3,16 @@
 这个模块把原来的“一次脚本跑完”拆成可恢复、可观测、可给前端轮询的原子工作流。
 项目按 `domain / application / infrastructure / interfaces` 四层组织。
 
+当前每日复盘、周策略、形态/趋势定义和输出路径的完整业务流程见
+[`review-process-design.md`](review-process-design.md)。
+
 ## 设计目标
 
 1. **断点恢复**：截图、个股复盘、组合摘要、最终文档分别落盘；API 余额不足或配额耗尽后，不需要重新抓图。
 2. **部分成功**：某只股票失败时，其他股票继续处理；最终文档仍会输出成功部分和失败原因。
 3. **前端友好**：所有状态都持久化为 JSON，前端可以轮询 `status`，也可以在任务队列中逐步调用 `step()`。
 4. **审计清楚**：状态文件记录每只股票的截图目录、个股复盘文件、尝试次数、失败阶段和错误信息。
-5. **周策略延续**：每周第一个交易日记录持仓成本并生成策略执行单；周内每日读取同一策略并追加执行回顾。
+5. **周策略延续**：周五收盘后或周末提前记录持仓成本并生成下一周策略执行单；周内每日读取同一策略并追加执行回顾。
 6. **操作复盘**：解析 `my_stock.txt` 中紧跟股票行的买入/卖出记录，评价执行质量并写入当日个股复盘。
 
 ## 工作流阶段
@@ -30,7 +33,7 @@ initialize
 全局阶段：
 
 - `summary`：基于成功个股复盘生成组合级摘要；失败时会在最终文档中降级为人工汇总提示。
-- `weekly strategy`：`local` 模式在组合摘要前读取或生成本周策略单，并把每日执行回顾写回策略文件。
+- `weekly strategy`：`local` 模式在组合摘要前读取或生成目标周策略单，并把每日执行回顾写回策略文件。
 - `render`：输出 `YYYYMMDD_持股个股复盘.md`，即使全部个股失败也会输出执行状态和失败原因。
 
 ## 状态文件
@@ -104,6 +107,16 @@ screenshots/YYYY/MM/DD/workflow_state.json
 .venv/bin/python -m review_workflow start --date 2026-09-10 --skip-capture --execute
 ```
 
+改完规则引擎后需要重算当日个股复盘时，用 `--force` 重置状态并复用已有截图：
+
+```bash
+.venv/bin/python -m review_workflow start --date 2026-09-10 --provider local \
+  --force --skip-capture --execute
+```
+
+`--force` 只归档工作流状态，不会归档截图目录；`analyzed` 的股票在 `resume` 时会被直接复用，
+因此要重算必须走 `--force`，或者删掉对应个股目录下的 `local当日复盘.md` 后再 `resume`。
+
 只根据当前状态重渲染最终文档，不调用模型：
 
 ```bash
@@ -115,6 +128,23 @@ screenshots/YYYY/MM/DD/workflow_state.json
 ```bash
 .venv/bin/python -m review_workflow document --date 2026-09-10
 ```
+
+## 公开数据源失败排查
+
+行情类字段（估值、板块、指数快照）来自东方财富 `push2delay` / `push2` 行情主机。
+以下情况都表现为 `公开行情接口请求失败：...：Remote end closed connection without response`：
+
+- 裸域名 `push2delay.eastmoney.com` 间歇性返回空响应（编号分片 `82.push2delay.eastmoney.com` 仍然可用）；
+- 短时间内连续请求过多被限流。
+
+处理方式：
+
+1. 代码侧已内置主机轮换：`EASTMONEY_QUOTE_HOSTS` 依次尝试裸域名、`82.` 编号分片与
+   `push2.eastmoney.com`，全部失败后整体重试一轮，因此偶发空响应会自动恢复；
+2. 若仍失败，`review_workflow resume --date YYYY-MM-DD --execute` 只重试 `analysis_failed`
+   的股票，不影响已完成的股票；
+3. 个股 OHLC/均线/RSI 来自搜狐历史日线，不受该主机影响；即使行情快照失败，
+   也不会污染复盘日数据，`stocks[].error` 会保留失败原因。
 
 CLI 输出 JSON。前端服务可以直接包装这些命令，也可以在 Python 服务中导入 `WorkflowAgent`。
 

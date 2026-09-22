@@ -12,7 +12,7 @@ import urllib.parse
 import urllib.request
 from datetime import date, datetime
 from pathlib import Path
-from typing import Any, Dict, Iterable, Optional
+from typing import Any, Callable, Dict, Iterable, Optional
 
 from playwright.sync_api import Locator, Page, TimeoutError as PlaywrightTimeoutError, sync_playwright
 
@@ -35,6 +35,64 @@ USER_AGENT = (
 
 class CaptureError(RuntimeError):
     """Raised when stock resolution or screenshot capture fails."""
+
+
+class LoginRequiredError(CaptureError):
+    """Raised when the saved Eastmoney login state is expired or missing."""
+
+
+class PersistentOcclusionError(CaptureError):
+    """Raised when overlays still cover capture targets after hiding."""
+
+
+LOGIN_DIALOG_SELECTORS = (
+    "#login-mask",
+    ".login-mask",
+    "#passport_login_box",
+    ".passport-login",
+    ".login_box",
+    'iframe[src*="passport.eastmoney.com"]',
+    'iframe[src*="login"]',
+)
+
+OCCLUSION_PROBE_JS = """
+selector => {
+    const elements = Array.from(document.querySelectorAll(selector)).filter(
+        element => {
+            const style = window.getComputedStyle(element);
+            const rect = element.getBoundingClientRect();
+            return style.display !== 'none' && style.visibility !== 'hidden' &&
+                   rect.width > 10 && rect.height > 10;
+        }
+    );
+    if (!elements.length) return null;
+    const target = elements[0];
+    const rect = target.getBoundingClientRect();
+    const probes = [
+        [rect.left + rect.width * 0.5, rect.top + rect.height * 0.5],
+        [rect.left + rect.width * 0.25, rect.top + rect.height * 0.25],
+        [rect.left + rect.width * 0.75, rect.top + rect.height * 0.75],
+    ];
+    for (const [x, y] of probes) {
+        const hit = document.elementFromPoint(x, y);
+        if (!hit || hit === target || target.contains(hit) || hit.contains(target)) {
+            continue;
+        }
+        const style = window.getComputedStyle(hit);
+        if (style.pointerEvents === 'none' || style.visibility === 'hidden' ||
+            style.display === 'none' || Number(style.opacity) === 0) {
+            continue;
+        }
+        hit.style.setProperty('display', 'none', 'important');
+        return {
+            tag: hit.tagName.toLowerCase(),
+            id: hit.id || '',
+            className: typeof hit.className === 'string' ? hit.className : '',
+        };
+    }
+    return null;
+}
+"""
 
 
 def parse_args() -> argparse.Namespace:
@@ -146,6 +204,98 @@ def first_visible(page: Page, selectors: Iterable[str]) -> Locator:
     raise CaptureError("未找到可截图的页面元素")
 
 
+def find_login_dialog(page: Page) -> Optional[str]:
+    """Return the selector of the first visible login dialog, if any."""
+
+    for selector in LOGIN_DIALOG_SELECTORS:
+        try:
+            handles = page.query_selector_all(selector)
+        except Exception:  # invalid selector or page navigating
+            continue
+        for handle in handles:
+            try:
+                if handle.is_visible():
+                    return selector
+            except Exception:
+                continue
+    return None
+
+
+def ensure_logged_in(page: Page) -> None:
+    """Fail fast when the saved login state has expired and a popup appeared.
+
+    截图前先确认没有登录弹窗：登录过期时东方财富会弹出登录框/遮罩，
+    继续截图只会得到带弹窗的废图（买卖五档也需要登录后才展示）。
+    """
+
+    dialog = find_login_dialog(page)
+    if dialog is None:
+        return
+    raise LoginRequiredError(
+        "东方财富登录态已过期：页面出现登录弹窗"
+        f"（匹配到 {dialog}）。请先执行 "
+        "python capture_eastmoney.py --login 重新登录后再截图。"
+    )
+
+
+def describe_occluder(occluder: Optional[Dict[str, Any]]) -> str:
+    if not occluder:
+        return "未知浮层"
+    parts = [str(occluder.get("tag") or "element")]
+    if occluder.get("id"):
+        parts.append(f"#{occluder['id']}")
+    class_name = str(occluder.get("className") or "").strip()
+    if class_name:
+        parts.append(f".{'.'.join(class_name.split()[:3])}")
+    return "".join(parts)
+
+
+def clear_occlusions(
+    page: Page,
+    selectors: Iterable[str],
+    *,
+    attempts: int = 3,
+) -> None:
+    """Hide overlays covering the capture targets, or fail with details.
+
+    每次截图前对目标元素做命中测试：发现浮层先自动隐藏并复测，
+    仍被遮挡则报错，避免产出被弹窗/广告盖住的截图。
+    """
+
+    selector_list = tuple(selectors)
+    last_occluder: Optional[Dict[str, Any]] = None
+    for _ in range(max(attempts, 1)):
+        # 登录弹窗不允许静默隐藏：登录过期时必须报错重新登录，
+        # 否则隐藏遮罩后截到的仍是未登录状态的废图。
+        dialog = find_login_dialog(page)
+        if dialog:
+            raise LoginRequiredError(
+                "截图前检测到登录弹窗（匹配到 "
+                f"{dialog}），登录态可能已过期。请先执行 "
+                "python capture_eastmoney.py --login 重新登录后再截图。"
+            )
+        hide_interference(page)
+        found: Optional[Dict[str, Any]] = None
+        for selector in selector_list:
+            try:
+                occluder = page.evaluate(OCCLUSION_PROBE_JS, selector)
+            except Exception:
+                occluder = None
+            if occluder:
+                found = occluder
+                break
+        if found is None:
+            return
+        last_occluder = found
+        print(f"  已隐藏遮挡截图的浮层：{describe_occluder(last_occluder)}")
+    raise PersistentOcclusionError(
+        "截图区域仍被浮层遮挡（"
+        f"{describe_occluder(last_occluder)}），自动隐藏失败。"
+        "请确认页面无弹窗后重试；若登录弹窗持续出现，"
+        "说明登录态已过期，请重新执行 python capture_eastmoney.py --login。"
+    )
+
+
 def wait_for_ready(page: Page, timeout: float) -> None:
     page.wait_for_selector(".quote_title_name", timeout=timeout * 1000)
     try:
@@ -196,6 +346,11 @@ def wait_for_capture_targets(page: Page, timeout: float) -> None:
             timeout=timeout * 1000,
         )
     except PlaywrightTimeoutError as exc:
+        if find_login_dialog(page):
+            raise LoginRequiredError(
+                "买卖五档加载超时：页面出现登录弹窗，登录态可能已过期。"
+                "请先执行 python capture_eastmoney.py --login 重新登录。"
+            ) from exc
         raise CaptureError("买卖五档数据加载超时") from exc
     first_visible(page, [".quote_title", ".zsquote3l", ".sider_quote_price"])
 
@@ -261,6 +416,50 @@ def hide_interference(page: Page) -> None:
         )
 
 
+def reload_and_settle(
+    page: Page,
+    timeout: float,
+    prepare: Optional[Callable[[Page], None]] = None,
+) -> None:
+    """重新加载页面并恢复就绪状态，用于遮挡无法清除时重抓。"""
+
+    page.reload(wait_until="domcontentloaded", timeout=timeout * 1000)
+    if prepare is not None:
+        prepare(page)
+    else:
+        page.wait_for_timeout(1500)
+
+
+def capture_with_recapture(
+    capture: Callable[[], None],
+    page: Page,
+    timeout: float,
+    *,
+    prepare: Optional[Callable[[Page], None]] = None,
+    reloads: int = 2,
+) -> None:
+    """执行截图；持续遮挡时重新加载页面后重抓，而不是带遮挡硬截。
+
+    登录过期（LoginRequiredError）不属于遮挡，直接向上抛出，不做重抓。
+    """
+
+    last_error: Optional[PersistentOcclusionError] = None
+    for attempt in range(max(reloads, 0) + 1):
+        try:
+            capture()
+            return
+        except PersistentOcclusionError as exc:
+            last_error = exc
+            if attempt < reloads:
+                print(
+                    "  截图区域仍被遮挡，重新加载页面后重抓"
+                    f"（第 {attempt + 1}/{reloads} 次）…"
+                )
+                reload_and_settle(page, timeout, prepare)
+    assert last_error is not None
+    raise last_error
+
+
 def capture_area(
     page: Page,
     selectors: Iterable[str],
@@ -268,14 +467,23 @@ def capture_area(
     timeout: float,
     *,
     wait_chart: bool = False,
+    prepare: Optional[Callable[[Page], None]] = None,
 ) -> None:
-    if wait_chart:
-        wait_for_chart(page, selectors, timeout)
-    hide_interference(page)
-    element = first_visible(page, selectors)
-    element.scroll_into_view_if_needed(timeout=timeout * 1000)
-    page.wait_for_timeout(800)
-    element.screenshot(path=path, timeout=timeout * 1000)
+    selector_list = tuple(selectors)
+
+    def capture() -> None:
+        if wait_chart:
+            wait_for_chart(page, selector_list, timeout)
+        clear_occlusions(page, selector_list)
+        element = first_visible(page, selector_list)
+        element.scroll_into_view_if_needed(timeout=timeout * 1000)
+        page.wait_for_timeout(800)
+        # 浮层可能在检查后、截图前的等待窗口内弹出（如 APP 推广弹窗），
+        # 截图前一刻再复测一次，发现遮挡就走重抓流程。
+        clear_occlusions(page, selector_list)
+        element.screenshot(path=path, timeout=timeout * 1000)
+
+    capture_with_recapture(capture, page, timeout, prepare=prepare)
 
 
 def capture_union(
@@ -283,28 +491,37 @@ def capture_union(
     selectors: Iterable[str],
     path: Path,
     timeout: float,
+    *,
+    prepare: Optional[Callable[[Page], None]] = None,
 ) -> None:
-    hide_interference(page)
-    boxes = []
-    for selector in selectors:
-        element = first_visible(page, [selector])
-        box = element.bounding_box()
-        if box is None:
-            raise CaptureError(f"元素没有可截图区域：{selector}")
-        boxes.append(box)
+    selector_list = tuple(selectors)
 
-    padding = 8
-    clip = {
-        "x": min(box["x"] for box in boxes) - padding,
-        "y": min(box["y"] for box in boxes) - padding,
-        "width": max(box["x"] + box["width"] for box in boxes)
-        - min(box["x"] for box in boxes)
-        + padding * 2,
-        "height": max(box["y"] + box["height"] for box in boxes)
-        - min(box["y"] for box in boxes)
-        + padding * 2,
-    }
-    page.screenshot(path=path, clip=clip, timeout=timeout * 1000)
+    def capture() -> None:
+        clear_occlusions(page, selector_list)
+        boxes = []
+        for selector in selector_list:
+            element = first_visible(page, [selector])
+            box = element.bounding_box()
+            if box is None:
+                raise CaptureError(f"元素没有可截图区域：{selector}")
+            boxes.append(box)
+
+        padding = 8
+        clip = {
+            "x": min(box["x"] for box in boxes) - padding,
+            "y": min(box["y"] for box in boxes) - padding,
+            "width": max(box["x"] + box["width"] for box in boxes)
+            - min(box["x"] for box in boxes)
+            + padding * 2,
+            "height": max(box["y"] + box["height"] for box in boxes)
+            - min(box["y"] for box in boxes)
+            + padding * 2,
+        }
+        # 与 capture_area 相同：截图前一刻复测遮挡，防止浮层在等待窗口内弹出。
+        clear_occlusions(page, selector_list)
+        page.screenshot(path=path, clip=clip, timeout=timeout * 1000)
+
+    capture_with_recapture(capture, page, timeout, prepare=prepare)
 
 
 def write_metadata(
@@ -355,9 +572,21 @@ def open_stock_page(
             page.route("**://push2.eastmoney.com/**", rewrite_to_delay_host)
         try:
             page.goto(stock["url"], wait_until="domcontentloaded")
-            wait_for_ready(page, attempt_timeout)
+            try:
+                wait_for_ready(page, attempt_timeout)
+            except PlaywrightTimeoutError as exc:
+                if find_login_dialog(page):
+                    raise LoginRequiredError(
+                        "行情页加载超时：页面出现登录弹窗，登录态可能已过期。"
+                        "请先执行 python capture_eastmoney.py --login 重新登录。"
+                    ) from exc
+                raise
+            ensure_logged_in(page)
             wait_for_capture_targets(page, attempt_timeout)
             return context, page
+        except LoginRequiredError:
+            context.close()
+            raise  # 登录态过期重试无效，直接提示重新登录
         except Exception as exc:
             last_error = exc
             context.close()

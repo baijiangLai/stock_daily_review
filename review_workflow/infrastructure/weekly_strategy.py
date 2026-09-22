@@ -10,7 +10,11 @@ from datetime import date, timedelta
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
-from .market_structure import classify_pattern, classify_trend
+from .market_structure import (
+    analyze_trend_from_bars,
+    build_price_zones,
+    classify_pattern,
+)
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -33,6 +37,51 @@ def _format(value: Optional[float], digits: int = 2, suffix: str = "") -> str:
 
 def _percent(value: Optional[float]) -> str:
     return "待核实" if value is None else f"{value * 100:.2f}%"
+
+
+def _zone_range(zone: Optional[Mapping[str, Any]]) -> str:
+    if not zone:
+        return "待核实"
+    return f"{_format(zone.get('zone_low'))} ~ {_format(zone.get('zone_high'))}"
+
+
+def _zone_reasons(zone: Optional[Mapping[str, Any]]) -> str:
+    if not zone:
+        return "待核实"
+    reasons = zone.get("reasons")
+    if not isinstance(reasons, list) or not reasons:
+        return "待核实"
+    return "；".join(str(reason) for reason in reasons)
+
+
+def _zone_confirmation(zone: Optional[Mapping[str, Any]]) -> str:
+    if not zone:
+        return "待核实"
+    confirmation = zone.get("breakout_confirmation")
+    if not isinstance(confirmation, dict):
+        return "待核实"
+    if "close_above" in confirmation:
+        return (
+            f"收盘 > {_format(confirmation.get('close_above'))}，"
+            f"量能 ≥ {_format(confirmation.get('volume_ratio_min'))} 倍"
+        )
+    return f"收盘 < {_format(confirmation.get('close_below'))}"
+
+
+def _price_in_zone(price: float, zone: Mapping[str, Any]) -> bool:
+    return float(zone.get("zone_low", 0)) <= price <= float(zone.get("zone_high", 0))
+
+
+def _zone_or_point(item: Mapping[str, Any], kind: str, index: int) -> str:
+    """优先展示区域；旧版策略没有区域字段时退回价格点。"""
+
+    zones = item.get(f"{kind}_zones", [])
+    if isinstance(zones, list) and len(zones) >= index:
+        zone = zones[index - 1]
+        if isinstance(zone, dict):
+            return _zone_range(zone)
+    legacy_key = "support" if kind == "support" else "pressure"
+    return _format(_number(item.get(f"{legacy_key}_{index}")))
 
 
 def _markdown(value: Any) -> str:
@@ -271,8 +320,8 @@ def _buy_plans(
     payload: Mapping[str, Any],
     *,
     close: float,
-    supports: Sequence[float],
-    resistances: Sequence[float],
+    support_zones: Sequence[Mapping[str, Any]],
+    resistance_zones: Sequence[Mapping[str, Any]],
     shares: int,
     weak_trend: bool,
     weekly: Mapping[str, Optional[float]],
@@ -285,9 +334,15 @@ def _buy_plans(
         and weekly_ma10 is not None
         and weekly_close >= weekly_ma10
     )
-    left_enabled = weekly_structure_ok and bool(supports)
+    left_enabled = weekly_structure_ok and bool(support_zones)
+    left_zone_low = (
+        min(zone["zone_low"] for zone in support_zones) if support_zones else None
+    )
+    left_zone_high = (
+        max(zone["zone_high"] for zone in support_zones) if support_zones else None
+    )
     left_signal = (
-        f"回踩 {_format(supports[-1])} - {_format(supports[0])} 分批承接；"
+        f"回踩支撑区 {_format(left_zone_low)} - {_format(left_zone_high)} 分批承接；"
         "要求量能不高于 5 日均量 80%、RSI6 ≤ 40，且周线收盘不破 10 周线。"
     )
     weekly_below_ma10 = (
@@ -298,10 +353,13 @@ def _buy_plans(
     elif not weekly_structure_ok:
         left_signal = "暂不左侧买入：周线数据不足或 10 周线待核实。"
 
+    selected_resistance = (
+        resistance_zones[-1]
+        if weak_trend and len(resistance_zones) > 1
+        else (resistance_zones[0] if resistance_zones else None)
+    )
     right_trigger = (
-        resistances[-1]
-        if weak_trend and len(resistances) > 1
-        else (resistances[0] if resistances else None)
+        selected_resistance.get("zone_high") if selected_resistance else None
     )
     volume_ma5 = _number(indicators.get("volume_ma5"))
     volume_text = (
@@ -310,7 +368,8 @@ def _buy_plans(
         else "成交量显著放大（5 日均量待核实）"
     )
     right_signal = (
-        f"收盘站上 {_format(right_trigger)}，且日收盘位于 MA5/MA10 上方，"
+        f"有效突破压力区 {_format(selected_resistance.get('zone_low') if selected_resistance else None)} ~ "
+        f"{_format(right_trigger)}：收盘站上 {_format(right_trigger)}，且日收盘位于 MA5/MA10 上方，"
         f"{volume_text}；周线需守住 5 周线或 10 周线。"
     )
     if weak_trend:
@@ -319,14 +378,15 @@ def _buy_plans(
     return {
         "left_side_buy": {
             "enabled": left_enabled,
-            "price_zone": [supports[-1], supports[0]] if supports else [],
+            "price_zone": [left_zone_low, left_zone_high] if support_zones else [],
             "quantity": _round_lot(shares, 0.10) if left_enabled else 0,
             "signal": left_signal,
         },
         "right_side_buy": {
-            "enabled": bool(resistances),
+            "enabled": bool(resistance_zones),
             "trigger_price": right_trigger,
-            "quantity": _round_lot(shares, 0.15) if resistances else 0,
+            "trigger_zone": selected_resistance,
+            "quantity": _round_lot(shares, 0.15) if resistance_zones else 0,
             "signal": right_signal,
         },
     }
@@ -357,6 +417,8 @@ def _pattern_and_trend(
     current_weekly = {**current_weekly, **weekly_indicators}
     weekly_volumes = [float(item["volume_hands"]) for item in weekly_history]
     weekly_volume_ma5 = _moving_average(weekly_volumes, 5)
+    history = payload.get("history", [])
+    daily_history = history if isinstance(history, list) else []
 
     return {
         "daily_pattern": classify_pattern(
@@ -364,12 +426,10 @@ def _pattern_and_trend(
             previous_daily,
             _number(indicators.get("volume_ma5")),
         ),
-        "daily_trend": classify_trend(
-            _number(current_daily.get("close")),
-            _number(indicators.get("ma5")),
-            _number(indicators.get("ma10")),
-            _number(indicators.get("ma20")),
-            _number(indicators.get("rsi6")),
+        "daily_trend": analyze_trend_from_bars(
+            daily_history,
+            timeframe="日线",
+            rsi_period=6,
         ),
         "weekly_pattern": classify_pattern(
             current_weekly,
@@ -377,13 +437,11 @@ def _pattern_and_trend(
             weekly_volume_ma5,
             timeframe="周线",
         ),
-        "weekly_trend": classify_trend(
-            _number(current_weekly.get("close")),
-            _number(current_weekly.get("ma5")),
-            _number(current_weekly.get("ma10")),
-            _number(current_weekly.get("ma20")),
-            _number(current_weekly.get("rsi12")),
-            rsi_name="周线RSI12",
+        "weekly_trend": analyze_trend_from_bars(
+            weekly_history,
+            timeframe="周线",
+            rsi_period=12,
+            compare_bars=4,
         ),
     }
 
@@ -402,6 +460,12 @@ def _strategy_item(payload: Mapping[str, Any], total_market_value: float) -> Dic
     pnl = market_value - cost * shares
     pnl_pct = pnl / (cost * shares) if cost and shares else None
     supports, resistances = _levels(payload)
+    history = payload.get("history", [])
+    price_zones = build_price_zones(
+        history if isinstance(history, list) else [],
+        close,
+        indicators,
+    )
     ma5 = _number(indicators.get("ma5"))
     ma10 = _number(indicators.get("ma10"))
     ma20 = _number(indicators.get("ma20"))
@@ -435,8 +499,8 @@ def _strategy_item(payload: Mapping[str, Any], total_market_value: float) -> Dic
     buy_plans = _buy_plans(
         payload,
         close=close,
-        supports=supports,
-        resistances=resistances,
+        support_zones=price_zones["support"],
+        resistance_zones=price_zones["resistance"],
         shares=shares,
         weak_trend=weak_trend,
         weekly=weekly_indicators,
@@ -461,6 +525,9 @@ def _strategy_item(payload: Mapping[str, Any], total_market_value: float) -> Dic
         "support_2": supports[1],
         "pressure_1": resistances[0],
         "pressure_2": resistances[1],
+        "support_zones": price_zones["support"],
+        "resistance_zones": price_zones["resistance"],
+        "right_trigger_price": buy_plans["right_side_buy"]["trigger_price"],
         "core_strategy": core_strategy,
         "reduce_quantity": _round_lot(shares, reduce_ratio),
         "buy_quantity": buy_plans["right_side_buy"]["quantity"],
@@ -516,7 +583,7 @@ def _new_strategy(review_date: str, payloads: Sequence[Mapping[str, Any]]) -> Di
 
     return {
         "version": 1,
-        "signal_schema": 3,
+        "signal_schema": 4,
         "week": None,
         "created_on": review_date,
         "target_week_start": target_week.isoformat(),
@@ -599,7 +666,7 @@ def _upgrade_signal_schema(
     review_date: str,
     payloads: Sequence[Mapping[str, Any]],
 ) -> Dict[str, Any]:
-    if strategy.get("signal_schema") == 3:
+    if strategy.get("signal_schema") == 4:
         return strategy
     if strategy.get("baseline_holdings", {}) != _current_holdings(payloads):
         return strategy
@@ -619,7 +686,7 @@ def _upgrade_signal_schema(
             "date": review_date,
             "from_version": strategy.get("version", 1),
             "to_version": upgraded["version"],
-            "reason": "策略格式升级 v3：补充日线/周线形态与趋势定义，并同步左右侧买入与止损线。",
+            "reason": "策略格式升级 v4：补充趋势强度/变化、支撑压力区域，并同步左右侧买入触发区。",
         }
     ]
     upgraded["daily_reviews"] = strategy.get("daily_reviews", [])
@@ -655,6 +722,27 @@ def _stop_loss_price(item: Mapping[str, Any]) -> Optional[float]:
     return _number(plan.get("price")) if isinstance(plan, dict) else None
 
 
+def _right_side_breakout_confirmed(
+    item: Mapping[str, Any], payload: Mapping[str, Any]
+) -> Tuple[bool, List[str]]:
+    close = _number(payload.get("bar", {}).get("close"))
+    trigger = _number(item.get("right_trigger_price"))
+    if close is None or trigger is None or close <= trigger:
+        return False, []
+
+    indicators = payload.get("indicators", {})
+    volume = _number(payload.get("bar", {}).get("volume_hands"))
+    volume_ma5 = _number(indicators.get("volume_ma5"))
+    ma5 = _number(indicators.get("ma5"))
+    ma10 = _number(indicators.get("ma10"))
+    failed_conditions: List[str] = []
+    if volume is None or volume_ma5 is None or volume / volume_ma5 < 1.2:
+        failed_conditions.append("量能不足")
+    if ma5 is None or ma10 is None or close < ma5 or close < ma10:
+        failed_conditions.append("日线均线位置不足")
+    return not failed_conditions, failed_conditions
+
+
 def _item_status(item: Mapping[str, Any], payload: Mapping[str, Any]) -> str:
     close = _number(payload.get("bar", {}).get("close"))
     if close is None:
@@ -664,8 +752,14 @@ def _item_status(item: Mapping[str, Any], payload: Mapping[str, Any]) -> str:
         return "已触发止损线"
     if close <= float(item.get("support_1", 0)):
         return "已触发支撑/风控区"
-    if close >= float(item.get("pressure_2", 0)):
-        return "已触发突破区"
+    right_trigger = _number(item.get("right_trigger_price"))
+    if right_trigger is None:
+        right_trigger = _number(item.get("pressure_2"))
+    if right_trigger is not None and close > right_trigger:
+        confirmed, failed_conditions = _right_side_breakout_confirmed(item, payload)
+        if confirmed:
+            return "已有效突破压力区"
+        return "价格突破压力区，但右侧确认不足：" + "、".join(failed_conditions)
     if close >= float(item.get("pressure_1", 0)):
         return "进入压力/减仓区"
     return "未触发关键条件"
@@ -683,16 +777,38 @@ def _operation_status(item: Mapping[str, Any], payload: Mapping[str, Any]) -> st
     if stop_loss is not None and price <= stop_loss:
         return "操作价低于止损线：与周策略风控冲突"
     action = str(operation.get("action", ""))
+    support_zones = item.get("support_zones", [])
+    resistance_zones = item.get("resistance_zones", [])
     if action == "买入":
-        if price <= float(item.get("support_1", 0)):
+        if any(
+            isinstance(zone, dict) and _price_in_zone(price, zone)
+            for zone in support_zones
+        ):
             return "买入接近支撑：执行有安全边际"
-        if price >= float(item.get("pressure_1", 0)):
+        right_trigger = _number(item.get("right_trigger_price"))
+        if right_trigger is not None and price > right_trigger:
+            confirmed, _ = _right_side_breakout_confirmed(item, payload)
+            return (
+                "买入达到有效右侧突破条件"
+                if confirmed
+                else "买入突破压力区，但右侧确认不足"
+            )
+        if any(
+            isinstance(zone, dict) and _price_in_zone(price, zone)
+            for zone in resistance_zones
+        ):
             return "买入接近压力：存在追高风险"
         return "买入位于中性区间"
     if action == "卖出":
-        if price >= float(item.get("pressure_1", 0)):
+        if any(
+            isinstance(zone, dict) and _price_in_zone(price, zone)
+            for zone in resistance_zones
+        ):
             return "卖出接近压力：执行质量较好"
-        if price <= float(item.get("support_1", 0)):
+        if any(
+            isinstance(zone, dict) and _price_in_zone(price, zone)
+            for zone in support_zones
+        ):
             return "卖出接近支撑：执行质量偏差"
         return "卖出位于中性区间"
     return "操作类型待核实"
@@ -790,6 +906,166 @@ def _apply_daily_review(
     return strategy
 
 
+def _item_definition_text(key: str, definition: Any) -> str:
+    """渲染单只股票的形态/趋势定义文本，兼容旧版缺失字段。"""
+
+    fallback = "形态待核实" if key.endswith("pattern") else "趋势待核实"
+    if not isinstance(definition, dict):
+        definition = {}
+    value = (
+        f"{definition.get('name', fallback)}："
+        f"{definition.get('definition', '定义待核实')}"
+    )
+    if key.endswith("_trend"):
+        value = (
+            f"趋势强度 {definition.get('strength', '待核实')}"
+            f"（{definition.get('strength_score', '待核实')} 分），"
+            f"趋势变化 {definition.get('direction_text', definition.get('direction', '待核实'))}。"
+        ) + value
+    return value
+
+
+def _item_zone_rows(item: Mapping[str, Any]) -> List[str]:
+    """渲染单只股票的支撑/压力区域表行，旧版策略退回价格点。"""
+
+    rows: List[str] = []
+    for label, zone_list, kind in (
+        ("支撑区", item.get("support_zones", []), "support"),
+        ("压力区", item.get("resistance_zones", []), "resistance"),
+    ):
+        detailed: List[Tuple[str, str, str, str, str]] = []
+        if isinstance(zone_list, list):
+            for index, zone in enumerate(zone_list, start=1):
+                if not isinstance(zone, dict):
+                    continue
+                strength = int(zone.get("strength", 1))
+                detailed.append(
+                    (
+                        f"{label}{index}",
+                        _zone_range(zone),
+                        f"{'★' * strength}（{strength}/5）",
+                        _zone_reasons(zone),
+                        _zone_confirmation(zone),
+                    )
+                )
+        if not detailed:
+            # 旧版策略只有价格点，没有区域、强度与突破确认。
+            detailed = [
+                (
+                    f"{label}{index}",
+                    _zone_or_point(item, kind, index),
+                    "待核实",
+                    "旧版策略：仅记录价格点，下次运行会自动升级",
+                    "待核实",
+                )
+                for index in (1, 2)
+            ]
+        for zone_label, zone_range, strength_text, reasons, confirmation in detailed:
+            rows.append(
+                f"| {zone_label} | {zone_range} | {strength_text} | "
+                f"{_markdown(reasons)} | {_markdown(confirmation)} |"
+            )
+    return rows
+
+
+def _render_stock_section(item: Mapping[str, Any]) -> List[str]:
+    """把单只股票的策略、区域、形态趋势、指标与截图聚合成独立小节。"""
+
+    name = _markdown(item.get("name", ""))
+    code = _markdown(item.get("code", ""))
+    stop_loss = item.get("stop_loss", {})
+    buy_quantity = item.get("buy_quantity", 0)
+    buy_text = f"{buy_quantity} 股（仅右侧确认）" if buy_quantity else "不左侧买入"
+
+    left = item.get("left_side_buy", {})
+    right = item.get("right_side_buy", {})
+    left_enabled = bool(left.get("enabled")) if isinstance(left, dict) else False
+    left_text = (
+        f"{'启用' if left_enabled else '停用'}；区间 "
+        f"{_format(left.get('price_zone')[0])} - {_format(left.get('price_zone')[-1])}；"
+        f"{left.get('signal', '')}"
+        if isinstance(left, dict) and left.get("price_zone")
+        else "待核实"
+    )
+    right_text = (
+        f"触发 {_format(right.get('trigger_price'))}，买入 {right.get('quantity', 0)} 股；"
+        f"{right.get('signal', '')}"
+        if isinstance(right, dict)
+        else "待核实"
+    )
+    stop_text = (
+        f"{_format(stop_loss.get('price'))}；{stop_loss.get('rule', '')}"
+        if isinstance(stop_loss, dict)
+        else "待核实"
+    )
+
+    daily = item.get("daily_signals", {})
+    weekly = item.get("weekly_signals", {})
+    if not isinstance(daily, dict):
+        daily = {}
+    if not isinstance(weekly, dict):
+        weekly = {}
+
+    snapshots = item.get("chart_snapshots", {})
+    if not isinstance(snapshots, dict):
+        snapshots = {}
+    daily_chart = snapshots.get("daily_kline")
+    weekly_chart = snapshots.get("weekly_kline")
+
+    lines = [
+        f"## {name}（{code}）",
+        "",
+        "### 核心策略与买卖触发",
+        "",
+        f"- 核心策略：**{_markdown(item.get('core_strategy', ''))}**；",
+        f"- 建议数量：减仓 {item.get('reduce_quantity', 0)} 股；{buy_text}；",
+        f"- 止损线：{_markdown(stop_text)}；",
+        f"- 左侧买入：{_markdown(left_text)}；",
+        f"- 右侧突破：{_markdown(right_text)}；",
+        "",
+        "### 形态与趋势定义",
+        "",
+        f"- 日线形态：{_item_definition_text('daily_pattern', item.get('daily_pattern'))}",
+        f"- 日线趋势：{_item_definition_text('daily_trend', item.get('daily_trend'))}",
+        f"- 周线形态：{_item_definition_text('weekly_pattern', item.get('weekly_pattern'))}",
+        f"- 周线趋势：{_item_definition_text('weekly_trend', item.get('weekly_trend'))}",
+        "",
+        "### 支撑/压力区域",
+        "",
+        "| 编号 | 区域 | 强度 | 形成原因 | 突破/跌破确认 |",
+        "| --- | --- | --- | --- | --- |",
+        *_item_zone_rows(item),
+        "",
+        "### 指标快照",
+        "",
+        "| 项目 | 数值 |",
+        "| --- | ---: |",
+        f"| 日线收盘 | {_format(daily.get('close'))} |",
+        f"| 日 MA5 / MA10 / MA20 | {_format(daily.get('ma5'))} / "
+        f"{_format(daily.get('ma10'))} / {_format(daily.get('ma20'))} |",
+        f"| 日 RSI6 / RSI12 | {_format(daily.get('rsi6'))} / {_format(daily.get('rsi12'))} |",
+        f"| 日量能 / 5日均量 | {_format(daily.get('volume_hands'), 2)} 手 / "
+        f"{_format(daily.get('volume_ma5'), 2)} 手 |",
+        f"| 周线收盘 | {_format(weekly.get('close'))}（{weekly.get('week_ending', '待核实')}） |",
+        f"| 周 MA5 / MA10 / MA20 | {_format(weekly.get('ma5'))} / "
+        f"{_format(weekly.get('ma10'))} / {_format(weekly.get('ma20'))} |",
+        f"| 周 RSI12 | {_format(weekly.get('rsi12'))} |",
+        "",
+        "### 日线/周线截图",
+        "",
+    ]
+    if daily_chart:
+        lines.append(f"- 日线：![{item.get('name', '')} 日线]({daily_chart})")
+    else:
+        lines.append("- 日线：待补抓")
+    if weekly_chart:
+        lines.append(f"- 周线：![{item.get('name', '')} 周线]({weekly_chart})")
+    else:
+        lines.append("- 周线：待补抓（周五/周末截图会自动生成并复制到本目录）")
+    lines.append("")
+    return lines
+
+
 def _render(strategy: Mapping[str, Any]) -> str:
     target_week = str(strategy.get("target_week_start") or strategy["created_on"])
     iso_year, iso_week = _iso_week(target_week)
@@ -820,137 +1096,17 @@ def _render(strategy: Mapping[str, Any]) -> str:
             f"{_markdown(holding.get('plan', ''))} |"
         )
 
-    lines.extend(
-        [
-            "",
-            "## 个股策略执行单",
-            "",
-            "| 股票 | 核心策略 | 风控/支撑 | 支撑观察 | 压力减仓 | 突破确认 | 建议数量 |",
-            "| --- | --- | ---: | ---: | ---: | ---: | ---: |",
-        ]
-    )
+    # 每只股票一个独立小节：策略、形态趋势、支撑/压力区域、指标与截图
+    # 都放在对应个股内部，避免在文档开头集中堆所有股票的明细。
     for item in strategy.get("items", []):
-        buy_quantity = item.get("buy_quantity", 0)
-        buy_text = f"{buy_quantity} 股（仅右侧确认）" if buy_quantity else "不左侧买入"
-        stop_loss = item.get("stop_loss", {})
-        lines.append(
-            f"| {_markdown(item.get('name', ''))} | {_markdown(item.get('core_strategy', ''))} | "
-            f"{_format(item.get('support_1'))} | {_format(item.get('support_2'))} | "
-            f"{_format(item.get('pressure_1'))} | {_format(item.get('pressure_2'))} | "
-            f"减仓 {item.get('reduce_quantity', 0)} 股；{buy_text}；"
-            f"止损 {_format(_number(stop_loss.get('price')) if isinstance(stop_loss, dict) else None)} |"
-        )
+        lines.extend(_render_stock_section(item))
 
     lines.extend(
         [
+            "## 组合级执行规则",
             "",
-            "## 形态与趋势定义",
-            "",
-            "| 股票 | 日线形态 | 日线趋势 | 周线形态 | 周线趋势 |",
-            "| --- | --- | --- | --- | --- |",
         ]
     )
-    for item in strategy.get("items", []):
-        fields = (
-            ("daily_pattern", "形态待核实"),
-            ("daily_trend", "趋势待核实"),
-            ("weekly_pattern", "形态待核实"),
-            ("weekly_trend", "趋势待核实"),
-        )
-        values = []
-        for key, fallback_name in fields:
-            definition = item.get(key, {})
-            if not isinstance(definition, dict):
-                definition = {}
-            values.append(
-                f"{definition.get('name', fallback_name)}："
-                f"{definition.get('definition', '定义待核实')}"
-            )
-        lines.append(
-            f"| {_markdown(item.get('name', ''))} | {_markdown(values[0])} | "
-            f"{_markdown(values[1])} | {_markdown(values[2])} | "
-            f"{_markdown(values[3])} |"
-        )
-
-    lines.extend(["", "## 日线/周线截图", ""])
-    for item in strategy.get("items", []):
-        snapshots = item.get("chart_snapshots", {})
-        daily = snapshots.get("daily_kline") if isinstance(snapshots, dict) else None
-        weekly = snapshots.get("weekly_kline") if isinstance(snapshots, dict) else None
-        lines.append(f"### {_markdown(item.get('name', ''))}")
-        if daily:
-            lines.append(f"- 日线：![{item.get('name', '')} 日线]({daily})")
-        else:
-            lines.append("- 日线：待补抓")
-        if weekly:
-            lines.append(f"- 周线：![{item.get('name', '')} 周线]({weekly})")
-        else:
-            lines.append("- 周线：待补抓（周五/周末截图会自动生成并复制到本目录）")
-        lines.append("")
-
-    lines.extend(
-        [
-            "## 左右侧买入信号与止损",
-            "",
-            "| 股票 | 左侧买入 | 右侧突破 | 止损线 |",
-            "| --- | --- | --- | ---: |",
-        ]
-    )
-    for item in strategy.get("items", []):
-        left = item.get("left_side_buy", {})
-        right = item.get("right_side_buy", {})
-        stop_loss = item.get("stop_loss", {})
-        left_enabled = bool(left.get("enabled")) if isinstance(left, dict) else False
-        left_text = (
-            f"{'启用' if left_enabled else '停用'}；区间 "
-            f"{_format(left.get('price_zone')[0])} - {_format(left.get('price_zone')[-1])}；"
-            f"{left.get('signal', '')}"
-            if isinstance(left, dict) and left.get("price_zone")
-            else "待核实"
-        )
-        right_text = (
-            f"触发 {_format(right.get('trigger_price'))}，买入 {right.get('quantity', 0)} 股；"
-            f"{right.get('signal', '')}"
-            if isinstance(right, dict)
-            else "待核实"
-        )
-        stop_text = (
-            f"{_format(stop_loss.get('price'))}；{stop_loss.get('rule', '')}"
-            if isinstance(stop_loss, dict)
-            else "待核实"
-        )
-        lines.append(
-            f"| {_markdown(item.get('name', ''))} | {_markdown(left_text)} | "
-            f"{_markdown(right_text)} | {_markdown(stop_text)} |"
-        )
-
-    lines.extend(
-        [
-            "",
-            "## 指标快照",
-            "",
-            "| 股票 | 日线收盘 | 日 MA5 / MA10 / MA20 | 日 RSI6 / RSI12 | 日量能 / 5日均量 | 周线收盘 | 周 MA5 / MA10 / MA20 | 周 RSI12 |",
-            "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
-        ]
-    )
-    for item in strategy.get("items", []):
-        daily = item.get("daily_signals", {})
-        weekly = item.get("weekly_signals", {})
-        if not isinstance(daily, dict):
-            daily = {}
-        if not isinstance(weekly, dict):
-            weekly = {}
-        lines.append(
-            f"| {_markdown(item.get('name', ''))} | {_format(daily.get('close'))} | "
-            f"{_format(daily.get('ma5'))} / {_format(daily.get('ma10'))} / {_format(daily.get('ma20'))} | "
-            f"{_format(daily.get('rsi6'))} / {_format(daily.get('rsi12'))} | "
-            f"{_format(daily.get('volume_hands'), 2)} 手 / {_format(daily.get('volume_ma5'), 2)} 手 | "
-            f"{_format(weekly.get('close'))}（{weekly.get('week_ending', '待核实')}） | "
-            f"{_format(weekly.get('ma5'))} / {_format(weekly.get('ma10'))} / {_format(weekly.get('ma20'))} | "
-            f"{_format(weekly.get('rsi12'))} |"
-        )
-
-    lines.extend(["", "## 组合级执行规则", ""])
     lines.extend(f"- {rule}" for rule in strategy.get("rules", []))
 
     changes = strategy.get("change_log", [])

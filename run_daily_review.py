@@ -18,16 +18,22 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-from playwright.sync_api import sync_playwright
+from playwright.sync_api import (
+    TimeoutError as PlaywrightTimeoutError,
+    sync_playwright,
+)
 
 from capture_eastmoney import (
     CaptureError,
     USER_AGENT,
     capture_area,
     capture_union,
+    ensure_logged_in,
+    find_login_dialog,
     run as capture_stock_screenshots,
     slugify,
     wait_for_chart,
+    LoginRequiredError,
 )
 from eastmoney_auth import (
     AuthStateError,
@@ -495,8 +501,20 @@ def open_board_page(browser: Any, board_code: str, args: argparse.Namespace, tim
             page.route("**://push2.eastmoney.com/**", rewrite_to_delay_host)
         try:
             page.goto(BOARD_QUOTE_URL.format(code=board_code), wait_until="domcontentloaded")
-            wait_for_board_page(page, attempt_timeout)
+            try:
+                wait_for_board_page(page, attempt_timeout)
+            except PlaywrightTimeoutError as exc:
+                if find_login_dialog(page):
+                    raise LoginRequiredError(
+                        "板块页加载超时：页面出现登录弹窗，登录态可能已过期。"
+                        "请先执行 python capture_eastmoney.py --login 重新登录。"
+                    ) from exc
+                raise
+            ensure_logged_in(page)
             return context, page
+        except LoginRequiredError:
+            context.close()
+            raise  # 登录态过期重试无效，直接提示重新登录
         except Exception as exc:
             last_error = exc
             context.close()
@@ -531,11 +549,16 @@ def capture_boards(
                     board_name = page.evaluate(
                         "() => document.querySelector('.quote_title_name')?.textContent?.trim() || ''"
                     )
+
+                    def restore_board(page_to_restore: Any = page) -> None:
+                        wait_for_board_page(page_to_restore, timeout)
+
                     capture_union(
                         page,
                         [".quote_title", ".bkquote2l"],
                         stock_dir / names["trading_data"],
                         timeout,
+                        prepare=restore_board,
                     )
                     capture_area(
                         page,
@@ -543,6 +566,7 @@ def capture_boards(
                         stock_dir / names["intraday_chart"],
                         timeout,
                         wait_chart=True,
+                        prepare=restore_board,
                     )
                     capture_area(
                         page,
@@ -550,6 +574,7 @@ def capture_boards(
                         stock_dir / names["daily_kline"],
                         timeout,
                         wait_chart=True,
+                        prepare=restore_board,
                     )
                     if index == 5:
                         capture_area(
@@ -557,6 +582,7 @@ def capture_boards(
                             [".quote3l_r"],
                             stock_dir / names["flow_and_members"],
                             timeout,
+                            prepare=restore_board,
                         )
                     else:
                         names.pop("flow_and_members")

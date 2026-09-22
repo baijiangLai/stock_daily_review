@@ -22,7 +22,12 @@ from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 from zoneinfo import ZoneInfo
 
-from .market_structure import classify_pattern, classify_trend
+from .market_structure import (
+    analyze_trend_from_bars,
+    build_price_zones,
+    classify_pattern,
+    synthesize_zone,
+)
 
 
 USER_AGENT = (
@@ -31,7 +36,17 @@ USER_AGENT = (
 )
 SHANGHAI_TIMEZONE = ZoneInfo("Asia/Shanghai")
 SOHU_HISTORY_API = "https://q.stock.sohu.com/hisHq"
-EASTMONEY_QUOTE_API = "https://push2delay.eastmoney.com/api/qt/stock/get"
+EASTMONEY_QUOTE_HOSTS = (
+    "https://push2delay.eastmoney.com",
+    "https://82.push2delay.eastmoney.com",
+    "https://push2.eastmoney.com",
+    # 限流有时只封 HTTPS（SNI 层），HTTP 80 端口的分片仍可用，
+    # 因此保留明文端点作为兜底（响应为公开行情 JSON，无敏感信息）。
+    "http://push2delay.eastmoney.com",
+    "http://82.push2delay.eastmoney.com",
+    "http://push2.eastmoney.com",
+)
+EASTMONEY_QUOTE_API = f"{EASTMONEY_QUOTE_HOSTS[0]}/api/qt/stock/get"
 EASTMONEY_FINANCIAL_API = "https://datacenter-web.eastmoney.com/api/data/v1/get"
 EASTMONEY_ANNOUNCEMENT_API = "https://np-anotice-stock.eastmoney.com/api/security/ann"
 EASTMONEY_SEARCH_API = "https://search-api-web.eastmoney.com/search/jsonp"
@@ -87,9 +102,9 @@ class F10Data:
     errors: List[str]
 
 
-def _request_json(url: str, timeout: float) -> Any:
+def _request_json(url: str, timeout: float, attempts: int = 3) -> Any:
     last_error: Optional[Exception] = None
-    for attempt in range(3):
+    for attempt in range(max(1, attempts)):
         request = urllib.request.Request(
             url,
             headers={
@@ -122,9 +137,118 @@ def _request_json(url: str, timeout: float) -> Any:
                 return json.loads(text)
         except (OSError, ValueError) as exc:
             last_error = exc
-            if attempt < 2:
+            if attempt < max(1, attempts) - 1:
                 time.sleep(0.5 * (attempt + 1))
     raise LocalReviewError(f"公开行情接口请求失败：{url}：{last_error}")
+
+
+def _request_quote_json(query: str, timeout: float) -> Any:
+    """请求东方财富行情接口，并在多个行情主机之间轮换。
+
+    裸域名 `push2delay.eastmoney.com` 会间歇性返回空响应（RemoteDisconnected），
+    编号分片 `82.push2delay.eastmoney.com` 仍然可用，因此逐个主机尝试，
+    全部失败后再整体重试一轮。
+    """
+
+    last_error: Optional[Exception] = None
+    for _ in range(2):
+        for host in EASTMONEY_QUOTE_HOSTS:
+            try:
+                return _request_json(f"{host}/api/qt/stock/get?{query}", timeout, attempts=1)
+            except LocalReviewError as exc:
+                last_error = exc
+    if last_error is not None:
+        raise last_error
+    raise LocalReviewError("东方财富行情接口不可用")
+
+
+TENCENT_QUOTE_API = "https://qt.gtimg.cn/q="
+
+
+def _tencent_symbol(code: str) -> Optional[str]:
+    if code.startswith(("6", "9", "5")):
+        return f"sh{code}"
+    if code.startswith(("0", "2", "3")):
+        return f"sz{code}"
+    return None
+
+
+def _request_text(url: str, timeout: float) -> str:
+    """请求文本行情接口（腾讯返回 GBK 编码）。"""
+
+    request = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+    try:
+        with urllib.request.urlopen(request, timeout=max(timeout, 5.0)) as response:
+            raw = _decode_response_payload(response.read())
+            for encoding in (
+                response.headers.get_content_charset(),
+                "gbk",
+                "gb18030",
+                "utf-8",
+            ):
+                if not encoding:
+                    continue
+                try:
+                    return raw.decode(encoding)
+                except (UnicodeDecodeError, LookupError):
+                    continue
+            return raw.decode("gbk", errors="replace")
+    except OSError as exc:
+        raise LocalReviewError(f"行情接口请求失败：{url}：{exc}") from exc
+
+
+def parse_tencent_quote(text: str, symbol: str) -> Optional[List[str]]:
+    """解析腾讯行情 `v_sh600522="1~名称~..."` 格式，返回字段列表。"""
+
+    for part in text.split(";"):
+        part = part.strip()
+        if not part.startswith(f"v_{symbol}="):
+            continue
+        payload = part.split("=", 1)[1].strip().strip('"')
+        fields = payload.split("~")
+        return fields if len(fields) > 38 else None
+    return None
+
+
+def fetch_tencent_snapshot_bar(
+    stock: Mapping[str, Any], review_date: str, timeout: float
+) -> Optional[DailyBar]:
+    """腾讯行情兜底：push2 集群整体限流时，用 qt.gtimg.cn 补当日快照。
+
+    腾讯字段（按 ~ 分隔）：3=现价、4=昨收、5=今开、6=总手、30=时间戳
+    （形如 20260921161443）、31=涨跌、32=涨跌%、33=最高、34=最低、
+    37=成交额（万）、38=换手率。
+    """
+
+    code = str(stock.get("code", "")).strip()
+    symbol = _tencent_symbol(code)
+    if not symbol:
+        return None
+    text = _request_text(f"{TENCENT_QUOTE_API}{symbol}", timeout)
+    fields = parse_tencent_quote(text, symbol)
+    if not fields or not _tencent_quote_matches_date(fields, review_date):
+        return None
+
+    def field_number(index: int) -> Optional[float]:
+        return _number(fields[index]) if index < len(fields) else None
+
+    close = field_number(3)
+    prev_close = field_number(4)
+    if close is None or prev_close is None:
+        return None
+    amount_wan = field_number(37)
+    return DailyBar(
+        date=review_date,
+        open=field_number(5) or close,
+        close=close,
+        change=field_number(31) or close - prev_close,
+        change_pct=field_number(32) or 0.0,
+        high=field_number(33) or close,
+        low=field_number(34) or close,
+        volume_hands=field_number(36) or field_number(6) or 0.0,
+        amount_wan=amount_wan if amount_wan is not None else 0.0,
+        turnover_pct=field_number(38),
+    )
 
 
 def _decode_response_payload(raw: bytes) -> bytes:
@@ -280,7 +404,12 @@ def fetch_stock_snapshot_bar(
             ),
         }
     )
-    payload = _request_json(f"{EASTMONEY_QUOTE_API}?{query}", timeout)
+    try:
+        payload = _request_quote_json(query, timeout)
+    except LocalReviewError:
+        # push2 行情集群可能整体限流（HTTP 000 / 空响应），
+        # 退回腾讯行情补当日快照，来源不同集群，通常不受影响。
+        return fetch_tencent_snapshot_bar(stock, review_date, timeout)
     data = payload.get("data") if isinstance(payload, dict) else None
     if not isinstance(data, dict) or not _snapshot_is_for_date(data, review_date):
         return None
@@ -368,6 +497,67 @@ def _snapshot_is_for_date(
     return snapshot_date == prior_friday.isoformat()
 
 
+def _tencent_quote_matches_date(fields: List[str], review_date: str) -> bool:
+    """校验腾讯行情快照时间（fields[30]）是否匹配复盘日，兼容周末取周五。"""
+
+    if len(fields) <= 30:
+        return False
+    timestamp_text = str(fields[30] or "")
+    if len(timestamp_text) < 8 or not timestamp_text[:8].isdigit():
+        return False
+    snapshot_date = f"{timestamp_text[:4]}-{timestamp_text[4:6]}-{timestamp_text[6:8]}"
+    parsed_review_date = date.fromisoformat(review_date)
+    return snapshot_date == review_date or (
+        parsed_review_date.weekday() >= 5
+        and snapshot_date == _prior_friday(review_date).isoformat()
+    )
+
+
+def _fetch_tencent_fields(stock: Mapping[str, Any]) -> Optional[List[str]]:
+    code = str(stock.get("code", "")).strip()
+    symbol = _tencent_symbol(code)
+    if not symbol:
+        return None
+    text = _request_text(f"{TENCENT_QUOTE_API}{symbol}", timeout=10.0)
+    return parse_tencent_quote(text, symbol)
+
+
+def fetch_tencent_valuation(
+    stock: Mapping[str, Any], review_date: str, timeout: float
+) -> Optional[Dict[str, Optional[float]]]:
+    """腾讯行情估值兜底：push2 限流时补市值/PE/PB 等字段。
+
+    腾讯字段：39=PE(TTM)、44=流通市值（亿）、45=总市值（亿）、46=PB；
+    量比（东财 f50）腾讯不提供，返回 None。
+    """
+
+    try:
+        fields = _fetch_tencent_fields(stock)
+    except LocalReviewError:
+        return None
+    if not fields or not _tencent_quote_matches_date(fields, review_date):
+        return None
+
+    def field_number(index: int) -> Optional[float]:
+        return _number(fields[index]) if index < len(fields) else None
+
+    def yi_to_yuan(index: int) -> Optional[float]:
+        value = field_number(index)
+        return value * 1e8 if value is not None else None
+
+    return {
+        "close": field_number(3),
+        "market_cap": yi_to_yuan(45),
+        "float_market_cap": yi_to_yuan(44),
+        "pe": field_number(39),
+        "pb": field_number(46),
+        "turnover_pct": field_number(38),
+        "change": field_number(31),
+        "change_pct": field_number(32),
+        "volume_ratio": None,
+    }
+
+
 def fetch_valuation(
     stock: Mapping[str, Any], review_date: str, timeout: float
 ) -> Dict[str, Optional[float]]:
@@ -380,7 +570,17 @@ def fetch_valuation(
         ]
     )
     query = urllib.parse.urlencode({"secid": f"{market}.{code}", "fields": fields})
-    payload = _request_json(f"{EASTMONEY_QUOTE_API}?{query}", timeout)
+    try:
+        payload = _request_quote_json(query, timeout)
+    except LocalReviewError:
+        # push2 行情集群整体限流时退回腾讯行情估值。
+        tencent = fetch_tencent_valuation(stock, review_date, timeout)
+        if tencent is not None:
+            return tencent
+        return {key: None for key in (
+            "close", "market_cap", "float_market_cap", "pe", "pb",
+            "turnover_pct", "change", "change_pct", "volume_ratio",
+        )}
     data = payload.get("data") if isinstance(payload, dict) else None
     if not isinstance(data, dict):
         return {key: None for key in (
@@ -425,7 +625,7 @@ def fetch_board_quotes(
             }
         )
         try:
-            payload = _request_json(f"{EASTMONEY_QUOTE_API}?{query}", timeout)
+            payload = _request_quote_json(query, timeout)
             data = payload.get("data") if isinstance(payload, dict) else {}
             if not isinstance(data, dict):
                 raise LocalReviewError(f"板块 {code} 返回格式异常")
@@ -535,7 +735,7 @@ def fetch_market_index_snapshot(
             "fields": "f43,f57,f58,f59,f60,f86,f169,f170",
         }
     )
-    payload = _request_json(f"{EASTMONEY_QUOTE_API}?{query}", timeout)
+    payload = _request_quote_json(query, timeout)
     data = payload.get("data") if isinstance(payload, dict) else {}
     if not isinstance(data, dict) or not _snapshot_is_for_date(
         data, review_date, allow_weekend_prior=True
@@ -870,6 +1070,61 @@ def _nearest_levels(bar: DailyBar, indicators: Mapping[str, Optional[float]]) ->
     return below[:2], above[:2]
 
 
+def _price_zones(data: LocalStockData) -> Dict[str, List[Dict[str, Any]]]:
+    """规则引擎计算支撑/压力区域；极端数据下退回原有最近价位口径。"""
+
+    zones = build_price_zones(
+        [asdict(item) for item in data.history],
+        data.bar.close,
+        data.indicators,
+    )
+    if zones["support"] and zones["resistance"]:
+        return zones
+    supports, resistances = _nearest_levels(data.bar, data.indicators)
+    if not zones["support"]:
+        zones["support"] = [
+            synthesize_zone(value, "SUPPORT", "原有最近支撑位") for value in supports
+        ]
+    if not zones["resistance"]:
+        zones["resistance"] = [
+            synthesize_zone(value, "RESISTANCE", "原有最近压力位") for value in resistances
+        ]
+    return zones
+
+
+def _zone_range_text(zone: Optional[Mapping[str, Any]]) -> str:
+    if not zone:
+        return "待核实"
+    return f"{float(zone['zone_low']):.2f} ~ {float(zone['zone_high']):.2f}"
+
+
+def _zone_edge_text(zone: Optional[Mapping[str, Any]], edge: str) -> str:
+    if not zone:
+        return "待核实"
+    return f"{float(zone[edge]):.2f}"
+
+
+def _price_in_zones(price: float, zones: Sequence[Mapping[str, Any]]) -> bool:
+    return any(
+        float(zone["zone_low"]) <= price <= float(zone["zone_high"])
+        for zone in zones
+        if "zone_low" in zone and "zone_high" in zone
+    )
+
+
+def _zone_confirmation_text(zone: Mapping[str, Any]) -> str:
+    confirmation = zone.get("breakout_confirmation")
+    if not isinstance(confirmation, dict):
+        return "待核实"
+    if "close_above" in confirmation:
+        return (
+            f"收盘 > {float(confirmation['close_above']):.2f}，"
+            f"量能 ≥ {float(confirmation['volume_ratio_min']):.1f} 倍 5 日均量，"
+            "且站上日线 MA5/MA10"
+        )
+    return f"收盘 < {float(confirmation['close_below']):.2f}"
+
+
 def _volume_ratio(bar: DailyBar, indicators: Mapping[str, Optional[float]]) -> Optional[float]:
     average = indicators.get("volume_ma5")
     return bar.volume_hands / average if average else None
@@ -951,13 +1206,15 @@ def _execution_grade(
 
 def _render_operation_section(data: LocalStockData) -> List[str]:
     operation = data.holding.get("operation")
-    supports, resistances = _nearest_levels(data.bar, data.indicators)
+    price_zones = _price_zones(data)
+    supports = price_zones["support"]
+    resistances = price_zones["resistance"]
     bar = asdict(data.bar)
     lines = ["### 今日实际操作复盘", ""]
     if not isinstance(operation, dict):
         return lines + [
-            f"- 未记录实际操作；后续按周策略执行，支撑 **{supports[0]:.2f} / {supports[1]:.2f}**，"
-            f"压力 **{resistances[0]:.2f} / {resistances[1]:.2f}**。",
+            f"- 未记录实际操作；后续按周策略执行，支撑区1 **{_zone_range_text(supports[0])}**，"
+            f"压力区1 **{_zone_range_text(resistances[0])}**。",
             "",
         ]
 
@@ -1017,16 +1274,17 @@ def _render_operation_section(data: LocalStockData) -> List[str]:
         )
 
     if action == "买入":
-        if price is not None and price >= resistances[0]:
+        if price is not None and _price_in_zones(price, resistances):
             lines.append(
-                "- 纪律评价：买入位置接近压力区，短线安全边际不足；后续必须用收盘站稳压力来验证。"
+                "- 纪律评价：买入位置落在压力区内，短线安全边际不足；"
+                "后续必须用收盘有效突破整个压力区来验证。"
             )
-        elif price is not None and price <= supports[1]:
+        elif price is not None and _price_in_zones(price, supports):
             lines.append(
-                "- 纪律评价：买入位置接近支撑区，价格有安全边际，但需防止弱势股左侧接飞刀。"
+                "- 纪律评价：买入位置落在支撑区内，价格有安全边际，但需防止弱势股左侧接飞刀。"
             )
         else:
-            lines.append("- 纪律评价：买入位置处于支撑与压力之间，属于中性执行区。")
+            lines.append("- 纪律评价：买入位置处于支撑区与压力区之间的中性执行区。")
 
         if close is not None and price is not None and close >= price:
             lines.extend(
@@ -1034,8 +1292,8 @@ def _render_operation_section(data: LocalStockData) -> List[str]:
                     "",
                     "### 后续操作",
                     "",
-                    f"- 当前买后处于正确状态。若收盘跌破 **{supports[0]:.2f}**，先减仓；"
-                    f"若冲高至 **{resistances[0]:.2f}-{resistances[1]:.2f}** 且量能衰减，锁定部分利润。",
+                    f"- 当前买后处于正确状态。若收盘跌破支撑区1下沿 **{_zone_edge_text(supports[0], 'zone_low')}**，先减仓；"
+                    f"若冲高至压力区1 **{_zone_range_text(resistances[0])}** 且量能衰减，锁定部分利润。",
                     "",
                 ]
             )
@@ -1045,19 +1303,20 @@ def _render_operation_section(data: LocalStockData) -> List[str]:
                     "",
                     "### 后续操作",
                     "",
-                    f"- 买后暂时被套，不能因为已买入而放宽风控。收盘跌破 **{supports[0]:.2f}** 必须降仓；"
-                    f"只有重新站上 **{resistances[0]:.2f}** 才视为买回正确。",
+                    f"- 买后暂时被套，不能因为已买入而放宽风控。收盘跌破支撑区1下沿 "
+                    f"**{_zone_edge_text(supports[0], 'zone_low')}** 必须降仓；"
+                    f"只有收盘有效突破压力区1上沿 **{_zone_edge_text(resistances[0], 'zone_high')}** 才视为买回正确。",
                     "",
                 ]
             )
     elif action == "卖出":
-        if price is not None and price >= resistances[0]:
+        if price is not None and _price_in_zones(price, resistances):
             lines.append(
-                "- 纪律评价：卖出位置接近压力区，属于利用强势降低仓位，执行质量较好。"
+                "- 纪律评价：卖出位置落在压力区内，属于利用强势降低仓位，执行质量较好。"
             )
-        elif price is not None and price <= supports[1]:
+        elif price is not None and _price_in_zones(price, supports):
             lines.append(
-                "- 纪律评价：卖出位置接近支撑区，属于恐慌性低位卖出，纪律质量偏差。"
+                "- 纪律评价：卖出位置落在支撑区内，属于恐慌性低位卖出，纪律质量偏差。"
             )
         else:
             lines.append("- 纪律评价：卖出位置处于中性区间。")
@@ -1069,7 +1328,7 @@ def _render_operation_section(data: LocalStockData) -> List[str]:
                     "### 后续操作",
                     "",
                     f"- 卖出后收盘不高于成交价，卖出目前有效。不要急于买回；"
-                    f"重新站上 **{resistances[0]:.2f}** 后再评估右侧买回。",
+                    f"重新站上压力区1上沿 **{_zone_edge_text(resistances[0], 'zone_high')}** 后再评估右侧买回。",
                     "",
                 ]
             )
@@ -1080,7 +1339,7 @@ def _render_operation_section(data: LocalStockData) -> List[str]:
                     "### 后续操作",
                     "",
                     f"- 卖出后股价继续上行，说明卖出偏早。禁止追高补回；"
-                    f"等待回踩 **{supports[0]:.2f}-{supports[1]:.2f}** 且止跌后再评估。",
+                    f"等待回踩支撑区1 **{_zone_range_text(supports[0])}** 且止跌后再评估。",
                     "",
                 ]
             )
@@ -1126,7 +1385,6 @@ def render_stock_review(data: LocalStockData) -> str:
     pnl = market_value - cost_value
     pnl_pct = pnl / cost_value if cost_value else None
     daily_pnl = _daily_pnl(holding, bar)
-    supports, resistances = _nearest_levels(bar, indicators)
     ma_values = [(name, indicators.get(key)) for name, key in (
         ("MA5", "ma5"), ("MA10", "ma10"), ("MA20", "ma20"), ("MA60", "ma60")
     )]
@@ -1140,13 +1398,29 @@ def render_stock_review(data: LocalStockData) -> str:
         asdict(data.history[-2]) if len(data.history) > 1 else None,
         indicators.get("volume_ma5"),
     )
-    current_trend = classify_trend(
-        bar.close,
-        indicators.get("ma5"),
-        indicators.get("ma10"),
-        indicators.get("ma20"),
-        indicators.get("rsi6"),
+    current_trend = analyze_trend_from_bars(
+        [asdict(item) for item in data.history], timeframe="日线", rsi_period=6
     )
+    price_zones = _price_zones(data)
+    zone_markdown_rows: List[str] = []
+    for prefix, zones in (
+        ("支撑区", price_zones["support"]),
+        ("压力区", price_zones["resistance"]),
+    ):
+        for index, zone in enumerate(zones, start=1):
+            zone_markdown_rows.append(
+                f"| {prefix}{index} | {_zone_range_text(zone)} | "
+                f"{'★' * zone['strength']}（{zone['strength']}/5） | "
+                f"{'；'.join(zone['reasons'])} | {_zone_confirmation_text(zone)} |"
+            )
+    breakout_line = "待核实：缺少有效压力区数据。"
+    if price_zones["resistance"]:
+        first_resistance = price_zones["resistance"][0]
+        breakout_line = (
+            f"有效突破：收盘 > **{_zone_edge_text(first_resistance, 'zone_high')}**"
+            f"（压力区1 {_zone_range_text(first_resistance)} 上沿），"
+            "且成交量达到现有右侧突破规则要求，并站上日线 MA5/MA10。"
+        )
 
     lines: List[str] = [
         f"## {data.stock.get('name', '')} {data.stock.get('code', '')}",
@@ -1188,8 +1462,30 @@ def render_stock_review(data: LocalStockData) -> str:
             f"| 5日均量 | {_fmt_hands(indicators.get('volume_ma5'))} | 今日量能 / 5日均量 = {_fmt(_volume_ratio(bar, indicators), 2, '倍')} |",
             f"| RSI6/12/24 | {_fmt(indicators.get('rsi6'))} / {_fmt(indicators.get('rsi12'))} / {_fmt(indicators.get('rsi24'))} | 短线强弱参考 |",
             "",
+            "#### 形态与趋势定义",
+            "",
             f"当前形态：**{current_pattern['name']}**。{current_pattern['definition']}",
             f"趋势定义：**{current_trend['name']}**。{current_trend['definition']}",
+            "",
+            f"**趋势状态**：{current_trend['name']}",
+            f"**趋势强度**：{current_trend['strength']}（强度评分 "
+            f"{current_trend['strength_score'] if current_trend['strength_score'] is not None else '待核实'}/100）",
+            f"**趋势变化**：{current_trend['direction_text']}",
+            "**趋势依据**：",
+            *[f"- {item}" for item in current_trend["evidence"]],
+            "",
+            f"**趋势解读**：{current_trend['interpretation']}",
+            "",
+            "#### 支撑/压力区域",
+            "",
+            "| 编号 | 区域 | 强度 | 形成原因 | 突破/跌破确认 |",
+            "| --- | --- | --- | --- | --- |",
+            *zone_markdown_rows,
+            "",
+            breakout_line,
+            "",
+            "> 以上趋势强度、趋势变化与支撑/压力区域全部由规则引擎计算，模型只做解释。",
+            "",
             f"技术结论：{'收盘低于主要均线，趋势仍偏弱。' if below_all else '收盘站上短期主要均线，短线结构修复。' if above_short else '均线位置分化，趋势尚未一致。'}",
             "",
             "### 板块表现",
@@ -1280,15 +1576,22 @@ def render_stock_review(data: LocalStockData) -> str:
     else:
         lines.append("- 未获取到可靠新闻或已按配置关闭动态检索。")
 
+    lines.extend(["", "### 关键价位与预案", ""])
+    for index, zone in enumerate(price_zones["support"], start=1):
+        lines.append(
+            f"- 支撑区{index}：**{_zone_range_text(zone)}**"
+            f"（强度 {zone['strength']}/5，{'；'.join(zone['reasons'])}）；"
+        )
+    for index, zone in enumerate(price_zones["resistance"], start=1):
+        lines.append(
+            f"- 压力区{index}：**{_zone_range_text(zone)}**"
+            f"（强度 {zone['strength']}/5，{'；'.join(zone['reasons'])}）；"
+        )
     lines.extend(
         [
-            "",
-            "### 关键价位与预案",
-            "",
-            f"- 第一/第二支撑：**{supports[0]:.2f}** / **{supports[1]:.2f}**；",
-            f"- 第一/第二压力：**{resistances[0]:.2f}** / **{resistances[1]:.2f}**；",
-            f"- 若收盘跌破第一支撑，优先降低风险，不等待解释；",
-            f"- 若放量站稳第一压力，可继续持有观察；冲高到第二压力且量能衰减时，优先降低单票集中度；",
+            f"- {breakout_line}",
+            "- 若收盘跌破支撑区1下沿，优先降低风险，不等待解释；",
+            "- 若放量站稳压力区1上沿，可继续持有观察；冲高到压力区2且量能衰减时，优先降低单票集中度；",
             "- 禁止因为超卖或大涨而临时放宽风控；所有价位需在下一交易日开盘前复核。",
             "",
             f"> 数据来源：{data.source_note}本节为规则生成，不构成投资建议。",
